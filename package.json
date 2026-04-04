@@ -1,0 +1,67 @@
+{
+  "name": "orbit-hub",
+  "displayName": "Orbit Hub",
+  "description": "Multi-account quota dashboard for Anti-Gravity IDE",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "orbit-hub",
+          "title": "Orbit Hub",
+          "icon": "resources/orbit-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "orbit-hub": [
+        {
+          "type": "webview",
+          "id": "orbitHub.panel",
+          "name": "Orbit Hub",
+          "icon": "resources/orbit-icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "orbitHub.addAccount",
+        "title": "Orbit Hub: Add Account"
+      },
+      {
+        "command": "orbitHub.refresh",
+        "title": "Orbit Hub: Refresh Now"
+      },
+      {
+        "command": "orbitHub.debug",
+        "title": "Orbit Hub: Debug Info"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.9",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.3.0"
+  }
+}
