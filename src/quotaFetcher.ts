@@ -1,3 +1,4 @@
+import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -97,20 +98,83 @@ function getBufStr(f: ProtoFields, field: number): string | null {
 
 export class QuotaFetcher {
 
-    async detectActiveAccount(): Promise<ActiveAccountInfo | null> {
-        const statePath = QuotaFetcher.defaultStatePath();
-        if (!fs.existsSync(statePath)) { return null; }
+    async fetchLiveSessionEmail(): Promise<string | null> {
         try {
-            const { email } = await this.readUserStatus(statePath);
-            return { id: email, label: email, statePath };
-        } catch {
-            return null;
+            // Try common providers in VS Code forks
+            const providers = ['google', 'antigravity_auth', 'cursor', 'microsoft', 'github'];
+            for (const p of providers) {
+                try {
+                    const session = await vscode.authentication.getSession(p, ['email', 'profile'], { silent: true });
+                    if (session?.account?.label) {
+                        console.log(`[OrbitHub] Detected live session via ${p}: ${session.account.label}`);
+                        return session.account.label;
+                    }
+                } catch { /* skip this provider */ }
+            }
+        } catch { /* ignore total failure */ }
+        return null;
+    }
+
+    async detectActiveAccount(): Promise<ActiveAccountInfo | null> {
+        const liveEmail = await this.fetchLiveSessionEmail();
+        
+        // Potential paths to scan, prioritized by global vs workspace
+        const home = os.homedir();
+        const appData = (process.platform === 'darwin') 
+            ? path.join(home, 'Library', 'Application Support', 'Antigravity')
+            : (process.platform === 'win32')
+                ? path.join(process.env['APPDATA'] ?? home, 'Anti-Gravity')
+                : path.join(home, '.config', 'Antigravity');
+        
+        const candidatePaths: { path: string, time: number }[] = [];
+        const globalPath = path.join(appData, 'User', 'globalStorage', 'state.vscdb');
+        if (fs.existsSync(globalPath)) {
+            candidatePaths.push({ path: globalPath, time: fs.statSync(globalPath).mtimeMs });
         }
+
+        // Also add any recent workspace storage paths
+        try {
+            const wsRoot = path.join(appData, 'User', 'workspaceStorage');
+            if (fs.existsSync(wsRoot)) {
+                const folders = fs.readdirSync(wsRoot);
+                for (const f of folders) {
+                    const p = path.join(wsRoot, f, 'state.vscdb');
+                    if (fs.existsSync(p)) {
+                        candidatePaths.push({ path: p, time: fs.statSync(p).mtimeMs });
+                    }
+                }
+            }
+        } catch { /* ignore scan failure */ }
+
+        // Sort by most recently modified
+        candidatePaths.sort((a, b) => b.time - a.time);
+
+        for (const entry of candidatePaths) {
+            try {
+                const { email } = await this.readUserStatus(entry.path);
+                // If we match live auth or if live auth is missing, found our winner
+                if (!liveEmail || email === liveEmail) {
+                    return { id: email, label: email, statePath: entry.path };
+                }
+            } catch { /* skip this DB */ }
+        }
+
+        return null;
     }
 
     async fetchQuota(account: ActiveAccountInfo): Promise<FetchResult> {
         try {
             const { email, userStatusBuf } = await this.readUserStatus(account.statePath);
+            
+            // If the DB is still for a different user, don't return those models as belonging to 'account'
+            if (account.id !== email && email !== 'unknown') {
+                return { 
+                    account, 
+                    models: [], 
+                    error: `Database is still synced to ${email}. Refreshing App...` 
+                };
+            }
+
             const models = this.parseUserStatus(userStatusBuf);
             // Update label in case account changed
             account.label = email;
@@ -125,7 +189,7 @@ export class QuotaFetcher {
         }
     }
 
-    // ── Read antigravityUnifiedStateSync.userStatus from SQLite ───────────────
+    // ── Read User Info from SQLite with Deep Discovery ────────────────────────
 
     private async readUserStatus(statePath: string): Promise<{
         email: string;
@@ -140,39 +204,94 @@ export class QuotaFetcher {
         const db = new SQL.Database(fs.readFileSync(statePath));
 
         try {
-            const r = db.exec(
-                "SELECT value FROM ItemTable WHERE key = 'antigravityUnifiedStateSync.userStatus' LIMIT 1"
-            );
-            if (!r.length || !r[0].values.length) {
-                throw new Error('antigravityUnifiedStateSync.userStatus not found');
+            let bestQuotaBuf: Buffer | null = null;
+            let bestEmail: string = 'unknown';
+
+            const scanRes = db.exec("SELECT key, value FROM ItemTable");
+            
+            const ensureBuffer = (v: any): Buffer | null => {
+                if (v instanceof Uint8Array) return Buffer.from(v);
+                if (typeof v === 'string') {
+                    if (/^[A-Za-z0-9+/=]{40,}$/.test(v)) {
+                        try { return Buffer.from(v, 'base64'); } catch {}
+                    }
+                    return Buffer.from(v, 'utf8');
+                }
+                return null;
+            };
+
+            const findQuotaRecursive = (buf: Buffer, depth: number): Buffer | null => {
+                if (depth > 5) return null;
+                const f = decode(buf);
+                if (f[33]) return buf;
+
+                for (const fields of Object.values(f)) {
+                    for (const v of fields) {
+                        if (Buffer.isBuffer(v)) {
+                            // Try as raw
+                            const res = findQuotaRecursive(v, depth + 1);
+                            if (res) return res;
+                            // Try as base64 string
+                            const s = v.toString('utf8');
+                            if (/^[A-Za-z0-9+/=]{40,}$/.test(s)) {
+                                try {
+                                    const b2 = Buffer.from(s, 'base64');
+                                    const res2 = findQuotaRecursive(b2, depth + 1);
+                                    if (res2) return res2;
+                                } catch {}
+                            }
+                        }
+                    }
+                }
+                return null;
+            };
+
+            if (scanRes.length && scanRes[0].values.length) {
+                for (const row of scanRes[0].values) {
+                    const key = String(row[0]);
+                    const valRaw = row[1];
+                    const buf = ensureBuffer(valRaw);
+                    if (!buf) continue;
+
+                    // 1. Detect Email
+                    const valStr = buf.toString('utf8');
+                    if (valStr.includes('@') && bestEmail === 'unknown') {
+                        const m = valStr.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+                        if (m) bestEmail = m[0];
+                    }
+
+                    // 2. Detect Quota Buf
+                    const quota = findQuotaRecursive(buf, 0);
+                    if (quota) {
+                        // If multiple found, prefer the bigger one
+                        if (!bestQuotaBuf || quota.length > bestQuotaBuf.length) {
+                            bestQuotaBuf = quota;
+                        }
+                    }
+                }
             }
 
-            // Structure: base64 → proto(field1 → proto(field2 → base64string → proto = userStatus))
-            const outerBuf = Buffer.from(String(r[0].values[0][0]), 'base64');
-            const outer = decode(outerBuf);
+            if (!bestQuotaBuf) {
+                console.error('[OrbitHub] No quota buffer found in DB scan.');
+                throw new Error('Could not find usage data in database.');
+            }
 
-            const layer1Buf = getBuf(outer, 1);
-            if (!layer1Buf) { throw new Error('userStatus: missing field1'); }
+            // Final identity extraction from the buffer if still unknown
+            if (bestEmail === 'unknown') {
+                const us = decode(bestQuotaBuf);
+                const candidateFields = [7, 10, 11, 3, 1, 4];
+                for (const f of candidateFields) {
+                    const val = getBufStr(us, f);
+                    if (val && val.includes('@')) {
+                        bestEmail = val;
+                        break;
+                    }
+                }
+            }
 
-            const layer1 = decode(layer1Buf);
-            const layer2Buf = getBuf(layer1, 2);
-            if (!layer2Buf) { throw new Error('userStatus: missing field1.field2'); }
-
-            const layer2 = decode(layer2Buf);
-            const innerB64 = getBuf(layer2, 1);
-            if (!innerB64) { throw new Error('userStatus: missing field1.field2.field1'); }
-
-            // innerB64 is a Buffer containing a base64 string
-            const innerStr = innerB64.toString('utf8');
-            const userStatusBuf = Buffer.from(innerStr, 'base64');
-
-            // Decode to get email
-            const us = decode(userStatusBuf);
-            const email = getBufStr(us, 7) ?? getBufStr(us, 3) ?? 'unknown';
-
-            return { email, userStatusBuf };
+            return { email: bestEmail, userStatusBuf: bestQuotaBuf };
         } finally {
-            db.close();
+            if (db) db.close();
         }
     }
 
@@ -181,19 +300,15 @@ export class QuotaFetcher {
     private parseUserStatus(buf: Buffer): RawModelQuota[] {
         const us = decode(buf);
         const now = Date.now();
-
-        // Models are in field33 → field1 array (same structure as before)
         const wrapper = getBuf(us, 33);
         if (!wrapper) { return []; }
 
         const wf = decode(wrapper);
         const modelBlobs = (wf[1] ?? []).filter((v): v is Buffer => Buffer.isBuffer(v));
-
         const results: RawModelQuota[] = [];
 
         for (const blob of modelBlobs) {
             const f = decode(blob);
-
             const nameBuf = getBuf(f, 1);
             if (!nameBuf) { continue; }
             const displayName = nameBuf.toString('utf8');
@@ -205,21 +320,15 @@ export class QuotaFetcher {
             const modelInfo = MODELS.find(m => m.id === modelId);
             if (!modelInfo) { continue; }
 
-            // field2.field1 = remaining credits (varint)
             const f2buf = getBuf(f, 2);
             const f2 = f2buf ? decode(f2buf) : {};
             const remaining = getNum(f2, 1) ?? 0;
 
-            // field15 contains:
-            //   field1 (32-bit float) = percentage remaining (0.0 to 1.0)
-            //   field2.field1 (varint) = reset unix seconds
             let pctRemaining: number | null = null;
             let resetAt = now + 7 * 24 * 60 * 60 * 1000;
 
             const f15buf = getBuf(f, 15);
             if (f15buf) {
-                // Read float at offset 1 (after tag byte 0x0d = field1, wire type 5)
-                // Tag 0x0d = field 1, wire type 5 (32-bit)
                 let i = 0;
                 while (i < f15buf.length - 4) {
                     const tag = f15buf[i];
@@ -230,7 +339,6 @@ export class QuotaFetcher {
                         pctRemaining = f15buf.readFloatLE(i);
                         i += 4;
                     } else if (wt === 2) {
-                        // length-delimited — read length then content
                         let len = 0, shift = 0, b = 0;
                         do { b = f15buf[i++]; len |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
                         if (fn === 2 && i + len <= f15buf.length) {
@@ -240,11 +348,24 @@ export class QuotaFetcher {
                             if (secs && secs > 0) {
                                 resetAt = secs * 1000;
                                 if (resetAt < now) {
-                                    // If timestamp is in the past, add cycles
-                                    const cycleMs = modelId === 'gemini-3-flash'
-                                        ? 4 * 60 * 60 * 1000 // 4h for Flash
-                                        : 7 * 24 * 60 * 60 * 1000;
-                                    while (resetAt < now) { resetAt += cycleMs; }
+                                    const dCycle = 7 * 24 * 60 * 60 * 1000;
+                                    const nCycle = 9 * 24 * 60 * 60 * 1000;
+                                    const tCycle = 10 * 24 * 60 * 60 * 1000;
+                                    
+                                    let nextReset = resetAt;
+                                    while (nextReset < now) nextReset += dCycle;
+
+                                    // If reset is too soon (< 2d) and potentially off, try cycles
+                                    if (nextReset < now + 2 * 24 * 60 * 60 * 1000) {
+                                        let next9 = resetAt;
+                                        while (next9 < now) next9 += nCycle;
+                                        if (next9 > nextReset) nextReset = next9;
+                                        
+                                        let next10 = resetAt;
+                                        while (next10 < now) next10 += tCycle;
+                                        if (next10 > nextReset) nextReset = next10;
+                                    }
+                                    resetAt = nextReset;
                                 }
                             }
                         }
@@ -256,16 +377,10 @@ export class QuotaFetcher {
                 }
             }
 
-            // Derive total from percentage if available
-            // pctRemaining = remaining / total  →  total = remaining / pctRemaining
             let total: number;
             if (pctRemaining !== null && pctRemaining > 0) {
                 total = Math.round(remaining / pctRemaining);
-            } else if (pctRemaining === 0 || (pctRemaining !== null && pctRemaining < 0.001)) {
-                // exhausted — remaining is near 0, use a default
-                total = Math.max(remaining, 1280);
             } else {
-                // no float found — assume exhausted, total unknown
                 total = Math.max(remaining, 1280);
             }
 
@@ -278,7 +393,6 @@ export class QuotaFetcher {
                 fetchedAt: now,
             });
         }
-
         return results;
     }
 
@@ -286,20 +400,11 @@ export class QuotaFetcher {
         const home = os.homedir();
         switch (process.platform) {
             case 'win32':
-                return path.join(
-                    process.env['APPDATA'] ?? home,
-                    'Anti-Gravity', 'User', 'globalStorage', 'state.vscdb'
-                );
+                return path.join(process.env['APPDATA'] ?? home, 'Anti-Gravity', 'User', 'globalStorage', 'state.vscdb');
             case 'darwin':
-                return path.join(
-                    home, 'Library', 'Application Support',
-                    'Antigravity', 'User', 'globalStorage', 'state.vscdb'
-                );
+                return path.join(home, 'Library', 'Application Support', 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
             default:
-                return path.join(
-                    home, '.config',
-                    'Antigravity', 'User', 'globalStorage', 'state.vscdb'
-                );
+                return path.join(home, '.config', 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
         }
     }
 }

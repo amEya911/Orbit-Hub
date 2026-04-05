@@ -10,6 +10,20 @@ export function activate(context: vscode.ExtensionContext): void {
             const accounts = context.globalState.get('orbitHub.accounts');
             const cache = context.globalState.get('orbitHub.quotaCache');
             vscode.window.showInformationMessage(JSON.stringify({ accounts, cache }, null, 2), { modal: true });
+        }),
+        vscode.commands.registerCommand('orbitHub.debug', async () => {
+            const sessionsByProvider: any = {};
+            const providers = ['google', 'github', 'microsoft', 'cursor', 'antigravity', 'antigravity_auth'];
+            for (const p of providers) {
+                try {
+                    const s = await vscode.authentication.getSession(p, ['email'], { silent: true });
+                    if (s) {
+                        sessionsByProvider[p] = { id: s.account.id, label: s.account.label };
+                    }
+                } catch { /* skip */ }
+            }
+            const accounts = context.globalState.get('orbitHub.accounts');
+            vscode.window.showInformationMessage('Orbit Hub Debug: ' + JSON.stringify({ sessionsByProvider, accounts }, null, 2), { modal: true });
         })
     );
     const accountManager = new AccountManager(context);
@@ -24,6 +38,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('orbitHub.refresh', () => provider.refresh())
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('orbitHub.reset', async () => {
+            await accountManager.resetAll();
+            await provider.refresh();
+            vscode.window.showInformationMessage('Orbit Hub: Data Reset');
+        })
     );
 
     // Poll every 25 seconds

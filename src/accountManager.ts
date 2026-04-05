@@ -76,4 +76,9 @@ export class AccountManager {
         all[quota.accountId] = quota;
         await this.context.globalState.update(QUOTA_KEY, all);
     }
+
+    async resetAll(): Promise<void> {
+        await this.context.globalState.update(ACCOUNTS_KEY, []);
+        await this.context.globalState.update(QUOTA_KEY, {});
+    }
 }

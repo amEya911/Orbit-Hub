@@ -30,6 +30,8 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 await this.refresh();
             } else if (msg.type === 'refresh') {
                 await this.refresh();
+            } else if (msg.type === 'reset') {
+                await vscode.commands.executeCommand('orbitHub.reset');
             }
         });
     }
@@ -60,6 +62,13 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
 
                 // Fetch quota only for the active one
                 const result = await this.quotaFetcher.fetchQuota(active);
+                
+                // Store error if any (to show sync status in UI)
+                const accIdx = accounts.findIndex(a => a.id === active.id);
+                if (accIdx >= 0) {
+                    (accounts[accIdx] as any).syncError = result.error;
+                }
+
                 if (result.models.length > 0) {
                     await this.accountManager.updateCachedQuota({
                         accountId: active.id,
@@ -99,17 +108,19 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     ? Math.round((cached.remaining / cached.total) * 100)
                     : 0;
 
-                // Estimation for offline/stale accounts:
-                // If we are past the reset time, assume it's back to 100%
+                let isEstimation = false;
                 if (!acc.isActive && cached.resetAt > 0 && now > cached.resetAt) {
                     pctRemaining = 100;
+                    isEstimation = true;
                 }
+                const isStale = acc.isActive && (now - cached.fetchedAt > 60 * 60 * 1000); // 1 hour
 
                 const state = (
                     pctRemaining <= 0 ? 'exhausted' :
                         pctRemaining <= 20 ? 'low' :
-                            'ok'
-                ) as 'ok' | 'low' | 'exhausted';
+                            isEstimation ? 'available' :
+                                isStale ? 'low' : 'ok'
+                ) as 'ok' | 'low' | 'exhausted' | 'available';
 
                 return {
                     modelId: cached.modelId,
@@ -120,12 +131,20 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     resetAt: cached.resetAt,
                     fetchedAt: cached.fetchedAt,
                     isActive: acc.isActive,
+                    isEstimation,
+                    isStale,
+                    dataAgeMs: now - cached.fetchedAt,
                     state,
                 };
             });
 
             return {
-                account: { id: acc.id, label: acc.label, isActive: acc.isActive },
+                account: { 
+                    id: acc.id, 
+                    label: acc.label, 
+                    isActive: acc.isActive,
+                    syncError: (acc as any).syncError
+                },
                 fetchedAt: cache?.fetchedAt ?? null,
                 models,
             };
