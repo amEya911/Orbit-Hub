@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 
 export interface Account {
-    id: string;   // derived from email/username in state.vscdb
+    id: string;
     label: string;
     statePath: string;
     isActive: boolean;
@@ -40,11 +40,19 @@ export class AccountManager {
         } else {
             accounts.push(account);
         }
-        // mark all others inactive
         for (const a of accounts) {
             if (a.id !== account.id) { a.isActive = false; }
         }
         await this.context.globalState.update(ACCOUNTS_KEY, accounts);
+    }
+
+    async removeAccount(id: string): Promise<void> {
+        const accounts = this.getAccounts().filter(a => a.id !== id);
+        await this.context.globalState.update(ACCOUNTS_KEY, accounts);
+        // Also remove cached quota for this account
+        const all = this.getAllCachedQuotas();
+        delete all[id];
+        await this.context.globalState.update(QUOTA_KEY, all);
     }
 
     async markActive(id: string): Promise<void> {

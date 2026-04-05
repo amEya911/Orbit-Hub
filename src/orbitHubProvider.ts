@@ -38,6 +38,14 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
         const active = await this.quotaFetcher.detectActiveAccount();
 
         if (active) {
+            // Only keep the currently active account — remove all others
+            const existing = this.accountManager.getAccounts();
+            for (const acc of existing) {
+                if (acc.id !== active.id) {
+                    await this.accountManager.removeAccount(acc.id);
+                }
+            }
+
             await this.accountManager.upsertAccount({
                 id: active.id,
                 label: active.label,
@@ -70,7 +78,6 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
 
         const accounts = this.accountManager.getAccounts();
         const allCached = this.accountManager.getAllCachedQuotas();
-        const now = Date.now();
 
         const payload = accounts.map(acc => {
             const cache = allCached[acc.id] ?? null;
@@ -81,15 +88,13 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     return { modelId: m.id, modelName: m.name, state: 'unknown' as const };
                 }
 
-                // resetAt from fetcher is already rolled to the next future reset —
-                // never treat as "reset passed" based on timestamp comparison here.
-                const usedPct = cached.total > 0
-                    ? Math.max(0, Math.min(100, ((cached.total - cached.remaining) / cached.total) * 100))
+                const pctRemaining = cached.total > 0
+                    ? Math.round((cached.remaining / cached.total) * 100)
                     : 0;
 
                 const state = (
-                    cached.remaining === 0 ? 'exhausted' :
-                        usedPct >= 80 ? 'low' :
+                    pctRemaining <= 0 ? 'exhausted' :
+                        pctRemaining <= 20 ? 'low' :
                             'ok'
                 ) as 'ok' | 'low' | 'exhausted';
 
@@ -98,9 +103,9 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     modelName: cached.modelName,
                     remaining: cached.remaining,
                     total: cached.total,
+                    pctRemaining,
                     resetAt: cached.resetAt,
                     fetchedAt: cached.fetchedAt,
-                    usedPct,
                     isActive: acc.isActive,
                     state,
                 };
