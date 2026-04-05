@@ -240,8 +240,9 @@ export class QuotaFetcher {
                             if (secs && secs > 0) {
                                 resetAt = secs * 1000;
                                 if (resetAt < now) {
+                                    // If timestamp is in the past, add cycles
                                     const cycleMs = modelId === 'gemini-3-flash'
-                                        ? 5 * 60 * 60 * 1000
+                                        ? 4 * 60 * 60 * 1000 // 4h for Flash
                                         : 7 * 24 * 60 * 60 * 1000;
                                     while (resetAt < now) { resetAt += cycleMs; }
                                 }

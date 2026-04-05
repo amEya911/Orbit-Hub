@@ -35,39 +35,45 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
     }
 
     async refresh(): Promise<void> {
-        const active = await this.quotaFetcher.detectActiveAccount();
+        try {
+            const active = await this.quotaFetcher.detectActiveAccount();
+            const accounts = this.accountManager.getAccounts();
 
-        if (active) {
-            // Only keep the currently active account — remove all others
-            const existing = this.accountManager.getAccounts();
-            for (const acc of existing) {
-                if (acc.id !== active.id) {
-                    await this.accountManager.removeAccount(acc.id);
+            if (active) {
+                let found = false;
+                for (const acc of accounts) {
+                    if (acc.id === active.id) {
+                        acc.isActive = true;
+                        acc.label = active.label;
+                        acc.statePath = active.statePath;
+                        found = true;
+                    } else {
+                        acc.isActive = false;
+                    }
                 }
+                if (!found) {
+                    accounts.push({ ...active, isActive: true });
+                }
+
+                // Persist the updated account list
+                await this.context.globalState.update('orbitHub.accounts', accounts);
+
+                // Fetch quota only for the active one
+                const result = await this.quotaFetcher.fetchQuota(active);
+                if (result.models.length > 0) {
+                    await this.accountManager.updateCachedQuota({
+                        accountId: active.id,
+                        models: result.models,
+                        fetchedAt: Date.now(),
+                    });
+                }
+            } else {
+                // System might be offline or app closed
+                for (const acc of accounts) { acc.isActive = false; }
+                await this.context.globalState.update('orbitHub.accounts', accounts);
             }
-
-            await this.accountManager.upsertAccount({
-                id: active.id,
-                label: active.label,
-                statePath: active.statePath,
-                isActive: true,
-            });
-
-            const result = await this.quotaFetcher.fetchQuota(active);
-
-            if (!result.error && result.models.length > 0) {
-                const existing = this.accountManager.getCachedQuota(active.id);
-                const mergedModels: ModelCache[] = result.models.map(m => ({
-                    ...(existing?.models.find(e => e.modelId === m.modelId) ?? {}),
-                    ...m,
-                }));
-
-                await this.accountManager.updateCachedQuota({
-                    accountId: active.id,
-                    models: mergedModels,
-                    fetchedAt: Date.now(),
-                });
-            }
+        } catch (err) {
+            console.error('[OrbitHub] Refresh failed:', err);
         }
 
         this.sendState();
@@ -88,9 +94,16 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     return { modelId: m.id, modelName: m.name, state: 'unknown' as const };
                 }
 
-                const pctRemaining = cached.total > 0
+                const now = Date.now();
+                let pctRemaining = cached.total > 0
                     ? Math.round((cached.remaining / cached.total) * 100)
                     : 0;
+
+                // Estimation for offline/stale accounts:
+                // If we are past the reset time, assume it's back to 100%
+                if (!acc.isActive && cached.resetAt > 0 && now > cached.resetAt) {
+                    pctRemaining = 100;
+                }
 
                 const state = (
                     pctRemaining <= 0 ? 'exhausted' :

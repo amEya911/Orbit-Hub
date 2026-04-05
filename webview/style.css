@@ -48,7 +48,10 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 10px;
+    margin-bottom: 5px;
+    cursor: pointer;
+    user-select: none;
+    padding: 4px 0;
 }
 
 .account-info {
@@ -77,6 +80,32 @@ body {
     font-size: 13px;
     font-weight: 600;
     color: var(--vscode-foreground);
+    opacity: 0.9;
+}
+
+.chevron {
+    font-size: 9px;
+    width: 12px;
+    transition: transform 0.2s ease;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.6;
+}
+
+.account-section.collapsed .chevron {
+    transform: rotate(-90deg);
+}
+
+.account-body {
+    transition: all 0.25s ease-out;
+    opacity: 1;
+    max-height: 1000px;
+}
+
+.account-section.collapsed .account-body {
+    max-height: 0;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
 }
 
 .account-meta {
@@ -170,32 +199,42 @@ body {
 
 /* ── Progress bar ────────────────────────────────────────────────────────── */
 .bar-track {
-    height: 4px;
-    background: rgba(128, 128, 128, 0.2);
-    border-radius: 2px;
-    overflow: hidden;
-}
-
-.bar-fill {
-    height: 100%;
-    border-radius: 2px;
-    transition: width 0.4s ease;
-}
-
-.bar-fill-ok {
-    background: #d4a017;
-}
-
-/* yellow like Anti-Gravity */
-.bar-low {
-    background: #e06c1a;
-}
-
-.bar-exhausted {
-    background: rgba(128, 128, 128, 0.3);
-    width: 2px !important;
-}
-
-.bar-empty {
+    height: 6px;
+    display: flex;
+    gap: 3px;
     background: transparent;
+    border-radius: 0;
+    overflow: visible;
+}
+
+.segment {
+    flex: 1;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 1px;
+    transition: background 0.3s ease;
+}
+
+.segment.filled {
+    background: #d4a017; /* Bright yellow */
+}
+
+.segment.low {
+    background: #e06c1a; /* Orange */
+}
+
+.segment.exhausted {
+    background: rgba(128, 128, 128, 0.15);
+}
+
+.model-name-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.warn-icon {
+    color: #e06c1a;
+    font-size: 11px;
+    vertical-align: middle;
 }
