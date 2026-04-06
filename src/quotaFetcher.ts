@@ -353,12 +353,27 @@ export class QuotaFetcher {
         return results;
     }
 
+    /**
+     * Merge WAL frames into a copy of the database buffer.
+     *
+     * BUG FIX (Bugs 1 & 3): SQLite reuses the WAL file from the start after
+     * each checkpoint, writing a new salt pair into the WAL header. Frames
+     * from a previous WAL cycle that still exist beyond the end of the current
+     * write position carry the OLD salt. Without salt validation, those stale
+     * frames were being replayed on top of freshly-checkpointed pages,
+     * reverting the database to an older state and making all live changes
+     * invisible until Anti-Gravity was restarted (which triggers a full
+     * checkpoint + WAL reset).
+     *
+     * Fix: read salt1/salt2 from the WAL header and stop as soon as a frame's
+     * salt differs — those frames belong to a previous WAL generation.
+     */
     private mergeWal(dbBuf: Buffer, walPath: string): Buffer {
         if (!fs.existsSync(walPath)) { return dbBuf; }
         try {
             const walBuf = fs.readFileSync(walPath);
             if (walBuf.length < 32) { return dbBuf; }
-            
+
             const magic = walBuf.readUInt32BE(0);
             const magicLE = walBuf.readUInt32LE(0);
             let isLittleEndian = true;
@@ -366,27 +381,43 @@ export class QuotaFetcher {
             else if (magicLE === 0x377f0682 || magicLE === 0x377f0683) { isLittleEndian = true; }
             else { return dbBuf; }
 
-            const pageSize = isLittleEndian ? walBuf.readUInt32LE(8) : walBuf.readUInt32BE(8);
+            const read32 = (off: number): number =>
+                isLittleEndian ? walBuf.readUInt32LE(off) : walBuf.readUInt32BE(off);
+
+            const pageSize = read32(8);
             if (pageSize === 0 || (pageSize & (pageSize - 1)) !== 0) { return dbBuf; }
 
+            // Read the WAL-header salt pair.  Every valid frame in the current
+            // WAL generation must carry these same salts in its frame header
+            // (bytes 8–15 of each 24-byte frame header).
+            const walSalt1 = read32(16);
+            const walSalt2 = read32(20);
+
             let dbCopy = Buffer.from(dbBuf);
-            let offset = 32;
+            let offset = 32; // first frame starts right after the 32-byte WAL header
             const len = walBuf.length;
-            
+
             while (offset + 24 <= len) {
-                const pageNum = isLittleEndian ? walBuf.readUInt32LE(offset) : walBuf.readUInt32BE(offset);
+                const pageNum = read32(offset);
                 if (pageNum === 0) { break; }
+
+                // Validate that this frame belongs to the current WAL cycle.
+                // Stale frames from a previous cycle have different salts — stop here.
+                const frameSalt1 = read32(offset + 8);
+                const frameSalt2 = read32(offset + 12);
+                if (frameSalt1 !== walSalt1 || frameSalt2 !== walSalt2) { break; }
+
                 if (offset + 24 + pageSize > len) { break; }
 
                 const frameData = walBuf.subarray(offset + 24, offset + 24 + pageSize);
                 const targetOffset = (pageNum - 1) * pageSize;
-                
+
                 if (targetOffset + pageSize > dbCopy.length) {
                     const newBuf = Buffer.alloc(targetOffset + pageSize);
                     dbCopy.copy(newBuf);
                     dbCopy = newBuf;
                 }
-                
+
                 frameData.copy(dbCopy, targetOffset);
                 offset += 24 + pageSize;
             }
