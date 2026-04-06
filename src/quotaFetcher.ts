@@ -142,13 +142,20 @@ export class QuotaFetcher {
             let userEmail = 'unknown';
 
             try {
+                const liveAuthEmail = await this.detectLiveAuthEmail();
+                if (liveAuthEmail) {
+                    authEmail = liveAuthEmail;
+                }
+
                 // Step 1: Read authStatus email — updates INSTANTLY on switch.
-                const authRes = db.exec(
-                    "SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus' LIMIT 1"
-                );
-                if (authRes.length && authRes[0].values.length) {
-                    const parsed = JSON.parse(String(authRes[0].values[0][0]));
-                    if (parsed.email) { authEmail = parsed.email; }
+                if (authEmail === 'unknown') {
+                    const authRes = db.exec(
+                        "SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus' LIMIT 1"
+                    );
+                    if (authRes.length && authRes[0].values.length) {
+                        const parsed = JSON.parse(String(authRes[0].values[0][0]));
+                        if (parsed.email) { authEmail = parsed.email; }
+                    }
                 }
 
                 // Step 2: Read userStatus email — the subscription account that
@@ -295,6 +302,91 @@ export class QuotaFetcher {
         const wasmPath = path.join(path.dirname(sqlJsPath), 'sql-wasm.wasm');
         const wasmBinary = fs.readFileSync(wasmPath);
         return initSqlJs({ wasmBinary: wasmBinary.buffer as ArrayBuffer });
+    }
+
+    private async detectLiveAuthEmail(): Promise<string | null> {
+        const providers = ['antigravity_auth', 'antigravity', 'google'];
+
+        for (const provider of providers) {
+            const accountEmail = await this.detectAuthEmailFromAccounts(provider);
+            if (accountEmail) { return accountEmail; }
+        }
+
+        for (const provider of providers) {
+            const sessionEmail = await this.detectAuthEmailFromSessions(provider);
+            if (sessionEmail) { return sessionEmail; }
+        }
+
+        return null;
+    }
+
+    private async detectAuthEmailFromAccounts(provider: string): Promise<string | null> {
+        try {
+            const accounts = await vscode.authentication.getAccounts(provider);
+            for (const account of accounts) {
+                const email = this.extractEmailCandidate(account.label) ?? this.extractEmailCandidate(account.id);
+                if (email) { return email; }
+            }
+        } catch {
+            // Provider may not exist in this Anti-Gravity build.
+        }
+
+        return null;
+    }
+
+    private async detectAuthEmailFromSessions(provider: string): Promise<string | null> {
+        const scopeVariants: ReadonlyArray<ReadonlyArray<string>> = [
+            [],
+            ['email'],
+        ];
+
+        for (const scopes of scopeVariants) {
+            try {
+                const session = await vscode.authentication.getSession(provider, scopes, { silent: true });
+                const email = this.extractEmailFromSession(session);
+                if (email) { return email; }
+            } catch {
+                // Some providers/scopes may not exist in every Anti-Gravity build.
+            }
+        }
+
+        return null;
+    }
+
+    private extractEmailFromSession(session: vscode.AuthenticationSession | undefined): string | null {
+        if (!session) { return null; }
+
+        const candidates = [session.account.label, session.account.id];
+        for (const scope of session.scopes) {
+            candidates.push(scope);
+        }
+
+        for (const candidate of candidates) {
+            const email = this.extractEmailCandidate(candidate);
+            if (email) { return email; }
+        }
+
+        return null;
+    }
+
+    private extractEmailCandidate(candidate: string | undefined): string | null {
+        if (!candidate) { return null; }
+
+        const match = candidate.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+        if (match) { return match[0].toLowerCase(); }
+
+        try {
+            const parsed = JSON.parse(candidate) as Record<string, unknown>;
+            for (const value of Object.values(parsed)) {
+                if (typeof value !== 'string') { continue; }
+                const nestedMatch = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+                if (nestedMatch) { return nestedMatch[0].toLowerCase(); }
+            }
+        } catch {
+            // Not JSON; plain string candidates are handled above.
+        }
+
+        return null;
     }
 
     private extractEmailFromUserStatus(db: import('sql.js').Database): string | null {
@@ -461,16 +553,32 @@ export class QuotaFetcher {
             let dbCopy = Buffer.from(dbBuf);
             let offset = 32;
             const len = walBuf.length;
+            let lastCommitDbSize = 0;
+            let lastCommitOffset = -1;
 
             while (offset + 24 <= len) {
                 const pageNum = walBuf.readUInt32BE(offset);
                 if (pageNum === 0) { break; }
+                const dbSizeAfterCommit = walBuf.readUInt32BE(offset + 4);
 
                 const frameSalt1 = walBuf.readUInt32BE(offset + 8);
                 const frameSalt2 = walBuf.readUInt32BE(offset + 12);
                 if (frameSalt1 !== walSalt1 || frameSalt2 !== walSalt2) { break; }
 
                 if (offset + 24 + pageSize > len) { break; }
+                if (dbSizeAfterCommit !== 0) {
+                    lastCommitDbSize = dbSizeAfterCommit;
+                    lastCommitOffset = offset;
+                }
+                offset += 24 + pageSize;
+            }
+
+            if (lastCommitOffset < 0) { return dbBuf; }
+
+            offset = 32;
+            while (offset <= lastCommitOffset && offset + 24 <= len) {
+                const pageNum = walBuf.readUInt32BE(offset);
+                if (pageNum === 0) { break; }
 
                 const frameData = walBuf.subarray(offset + 24, offset + 24 + pageSize);
                 const targetOffset = (pageNum - 1) * pageSize;
@@ -483,6 +591,21 @@ export class QuotaFetcher {
 
                 frameData.copy(dbCopy, targetOffset);
                 offset += 24 + pageSize;
+            }
+
+            if (lastCommitDbSize > 0) {
+                const requiredBytes = lastCommitDbSize * pageSize;
+                if (requiredBytes > dbCopy.length) {
+                    const newBuf = Buffer.alloc(requiredBytes);
+                    dbCopy.copy(newBuf);
+                    dbCopy = newBuf;
+                } else if (requiredBytes < dbCopy.length) {
+                    dbCopy = dbCopy.subarray(0, requiredBytes);
+                }
+
+                if (dbCopy.length >= 32) {
+                    dbCopy.writeUInt32BE(lastCommitDbSize, 28);
+                }
             }
             return dbCopy;
         } catch {

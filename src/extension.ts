@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import { AccountManager } from './accountManager';
 import { QuotaFetcher } from './quotaFetcher';
 import { OrbitHubProvider } from './orbitHubProvider';
@@ -47,6 +49,54 @@ export function activate(context: vscode.ExtensionContext): void {
             vscode.window.showInformationMessage('Orbit Hub: Data Reset');
         })
     );
+
+    context.subscriptions.push(
+        vscode.authentication.onDidChangeSessions(e => {
+            if (e.provider.id === 'antigravity_auth' || e.provider.id === 'antigravity' || e.provider.id === 'google') {
+                void provider.refresh();
+            }
+        })
+    );
+
+    const statePath = QuotaFetcher.defaultStatePath();
+    const stateDir = path.dirname(statePath);
+    const watchedFiles = new Set([
+        path.basename(statePath),
+        path.basename(statePath) + '-wal',
+        path.basename(statePath) + '-shm',
+    ]);
+    let refreshTimeout: ReturnType<typeof setTimeout> | null = null;
+    const scheduleRefresh = (): void => {
+        if (refreshTimeout !== null) {
+            clearTimeout(refreshTimeout);
+        }
+        refreshTimeout = setTimeout(() => {
+            refreshTimeout = null;
+            void provider.refresh();
+        }, 300);
+    };
+
+    try {
+        const watcher = fs.watch(stateDir, (_eventType, filename) => {
+            if (!filename) { return; }
+            const changed = filename.toString();
+            if (watchedFiles.has(changed)) {
+                scheduleRefresh();
+            }
+        });
+
+        context.subscriptions.push({
+            dispose: () => {
+                if (refreshTimeout !== null) {
+                    clearTimeout(refreshTimeout);
+                    refreshTimeout = null;
+                }
+                watcher.close();
+            },
+        });
+    } catch {
+        // Polling remains as a fallback if the local state directory cannot be watched.
+    }
 
     // Poll every 25 seconds
     const timer = new TimerManager(25_000, () => { void provider.refresh(); });
