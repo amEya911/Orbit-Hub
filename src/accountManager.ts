@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 export interface Account {
     id: string;
     label: string;
+    authEmail?: string;     // Google OAuth email from authStatus (for switch detection)
     statePath: string;
     isActive: boolean;
 }
@@ -18,6 +19,7 @@ export interface ModelCache {
     modelName: string;
     remaining: number;
     total: number;
+    pctRemaining: number;   // float×100 integer (0–100) from the proto
     resetAt: number;
     fetchedAt: number;
 }

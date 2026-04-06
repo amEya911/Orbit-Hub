@@ -5,6 +5,12 @@ import { QuotaFetcher, MODELS } from './quotaFetcher';
 
 export class OrbitHubProvider implements vscode.WebviewViewProvider {
     private view?: vscode.WebviewView;
+    /** Tracks the authStatus email across polls for switch detection */
+    private lastAuthEmail: string | null = null;
+    /** Set when authEmail changes — cleared when userStatus provides a new account */
+    private switchPending = false;
+    /** The userStatus account id that was active before the detected switch */
+    private preTransitionUserId: string | null = null;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -42,11 +48,40 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
             const accounts = this.accountManager.getAccounts();
 
             if (active) {
+                // ── Switch detection via authEmail ─────────────────────────
+                // authStatus updates instantly on login/logout.
+                // If it changed since last poll, the user switched accounts.
+                if (this.lastAuthEmail !== null && active.authEmail !== this.lastAuthEmail) {
+                    this.switchPending = true;
+                    this.preTransitionUserId = active.id; // still the OLD userStatus email
+                }
+                this.lastAuthEmail = active.authEmail;
+
+                // If a switch is pending and userStatus still has the old email,
+                // Anti-Gravity hasn't synced the new subscription yet.
+                // Mark everything inactive and show "switching" state.
+                if (this.switchPending && active.id === this.preTransitionUserId) {
+                    for (const acc of accounts) { acc.isActive = false; }
+                    // Inject a transient indicator for the UI
+                    (accounts as any).__switchPending = true;
+                    await this.context.globalState.update('orbitHub.accounts', accounts);
+                    this.sendState();
+                    return;
+                }
+
+                // If switch was pending but userStatus now has a NEW email → transition complete
+                if (this.switchPending) {
+                    this.switchPending = false;
+                    this.preTransitionUserId = null;
+                }
+
+                // ── Normal account update flow ────────────────────────────
                 let found = false;
                 for (const acc of accounts) {
                     if (acc.id === active.id) {
                         acc.isActive = true;
                         acc.label = active.label;
+                        acc.authEmail = active.authEmail;
                         acc.statePath = active.statePath;
                         found = true;
                     } else {
@@ -54,16 +89,22 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     }
                 }
                 if (!found) {
-                    accounts.push({ ...active, isActive: true });
+                    accounts.push({
+                        id: active.id,
+                        label: active.label,
+                        authEmail: active.authEmail,
+                        statePath: active.statePath,
+                        isActive: true,
+                    });
                 }
 
                 // Persist the updated account list
                 await this.context.globalState.update('orbitHub.accounts', accounts);
 
-                // Fetch quota only for the active one
+                // Fetch quota for the active account
                 const result = await this.quotaFetcher.fetchQuota(active);
-                
-                // Store error if any (to show sync status in UI)
+
+                // Store sync error if any (for UI display)
                 const accIdx = accounts.findIndex(a => a.id === active.id);
                 if (accIdx >= 0) {
                     (accounts[accIdx] as any).syncError = result.error;
@@ -104,9 +145,11 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 }
 
                 const now = Date.now();
-                let pctRemaining = cached.total > 0
-                    ? Math.round((cached.remaining / cached.total) * 100)
-                    : 0;
+                let pctRemaining = cached.pctRemaining ?? (
+                    cached.total > 0
+                        ? Math.round((cached.remaining / cached.total) * 100)
+                        : 0
+                );
 
                 let isEstimation = false;
                 if (!acc.isActive && cached.resetAt > 0 && now > cached.resetAt) {
@@ -139,9 +182,9 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
             });
 
             return {
-                account: { 
-                    id: acc.id, 
-                    label: acc.label, 
+                account: {
+                    id: acc.id,
+                    label: acc.label,
                     isActive: acc.isActive,
                     syncError: (acc as any).syncError
                 },

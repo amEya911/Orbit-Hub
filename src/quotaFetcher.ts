@@ -24,8 +24,9 @@ export const MODELS: ModelInfo[] = [
 ];
 
 export interface ActiveAccountInfo {
-    id: string;
+    id: string;         // userStatus email — the quota/subscription owner
     label: string;
+    authEmail: string;  // authStatus email — Google OAuth (may differ), changes instantly on switch
     statePath: string;
 }
 
@@ -34,6 +35,7 @@ export interface RawModelQuota {
     modelName: string;
     remaining: number;
     total: number;
+    pctRemaining: number;
     resetAt: number;
     fetchedAt: number;
 }
@@ -98,88 +100,89 @@ function getBufStr(f: ProtoFields, field: number): string | null {
 
 export class QuotaFetcher {
 
-    async fetchLiveSessionEmail(): Promise<string | null> {
-        try {
-            // Try common providers in VS Code forks
-            const providers = ['google', 'antigravity_auth', 'cursor', 'microsoft', 'github'];
-            for (const p of providers) {
-                try {
-                    const session = await vscode.authentication.getSession(p, ['email', 'profile'], { silent: true });
-                    if (session?.account?.label) {
-                        console.log(`[OrbitHub] Detected live session via ${p}: ${session.account.label}`);
-                        return session.account.label;
-                    }
-                } catch { /* skip this provider */ }
-            }
-        } catch { /* ignore total failure */ }
-        return null;
-    }
-
+    /**
+     * Detect the currently active account by reading antigravityAuthStatus
+     * (updates immediately on login) and cross-referencing with userStatus.
+     */
     async detectActiveAccount(): Promise<ActiveAccountInfo | null> {
-        const liveEmail = await this.fetchLiveSessionEmail();
-        
-        // Potential paths to scan, prioritized by global vs workspace
-        const home = os.homedir();
-        const appData = (process.platform === 'darwin') 
-            ? path.join(home, 'Library', 'Application Support', 'Antigravity')
-            : (process.platform === 'win32')
-                ? path.join(process.env['APPDATA'] ?? home, 'Anti-Gravity')
-                : path.join(home, '.config', 'Antigravity');
-        
-        const candidatePaths: { path: string, time: number }[] = [];
-        const globalPath = path.join(appData, 'User', 'globalStorage', 'state.vscdb');
-        if (fs.existsSync(globalPath)) {
-            candidatePaths.push({ path: globalPath, time: fs.statSync(globalPath).mtimeMs });
-        }
+        const statePath = QuotaFetcher.defaultStatePath();
+        if (!fs.existsSync(statePath)) { return null; }
 
-        // Also add any recent workspace storage paths
         try {
-            const wsRoot = path.join(appData, 'User', 'workspaceStorage');
-            if (fs.existsSync(wsRoot)) {
-                const folders = fs.readdirSync(wsRoot);
-                for (const f of folders) {
-                    const p = path.join(wsRoot, f, 'state.vscdb');
-                    if (fs.existsSync(p)) {
-                        candidatePaths.push({ path: p, time: fs.statSync(p).mtimeMs });
-                    }
-                }
-            }
-        } catch { /* ignore scan failure */ }
+            const SQL = await this.loadSql();
+            const dbBuf = fs.readFileSync(statePath);
+            const mergedBuf = this.mergeWal(dbBuf, statePath + '-wal');
+            const db = new SQL.Database(mergedBuf);
+            let authEmail = 'unknown';
+            let userEmail = 'unknown';
 
-        // Sort by most recently modified
-        candidatePaths.sort((a, b) => b.time - a.time);
-
-        for (const entry of candidatePaths) {
             try {
-                const { email } = await this.readUserStatus(entry.path);
-                // If we match live auth or if live auth is missing, found our winner
-                if (!liveEmail || email === liveEmail) {
-                    return { id: email, label: email, statePath: entry.path };
+                // Step 1: Read authStatus email — updates INSTANTLY on switch.
+                // This is the Google OAuth credential email, used to detect
+                // when the user switches accounts.
+                const authRes = db.exec(
+                    "SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus' LIMIT 1"
+                );
+                if (authRes.length && authRes[0].values.length) {
+                    const parsed = JSON.parse(String(authRes[0].values[0][0]));
+                    if (parsed.email) { authEmail = parsed.email; }
                 }
-            } catch { /* skip this DB */ }
-        }
 
-        return null;
+                // Step 2: Read userStatus email — the subscription account that
+                // OWNS the quota data. May differ from authEmail (different
+                // identity layers). Updates lazily (30–60s after switch).
+                const userStatusEmail = this.extractEmailFromUserStatus(db);
+                if (userStatusEmail && userStatusEmail !== 'unknown') {
+                    userEmail = userStatusEmail;
+                }
+            } finally {
+                db.close();
+            }
+
+            // Account identity = userStatus email (quota data belongs to it).
+            // Fall back to authStatus email only if userStatus is unavailable.
+            const id = userEmail !== 'unknown' ? userEmail
+                : authEmail !== 'unknown' ? authEmail
+                    : null;
+            if (!id) { return null; }
+
+            return {
+                id,
+                label: id,
+                authEmail: authEmail !== 'unknown' ? authEmail : id,
+                statePath,
+            };
+        } catch {
+            return null;
+        }
     }
 
+    /**
+     * Fetch quota for the active account. If userStatus hasn't synced yet
+     * for this account, returns empty models with a descriptive error.
+     */
     async fetchQuota(account: ActiveAccountInfo): Promise<FetchResult> {
         try {
-            const { email, userStatusBuf } = await this.readUserStatus(account.statePath);
-            
-            // If the DB is still for a different user, don't return those models as belonging to 'account'
-            if (account.id !== email && email !== 'unknown') {
-                return { 
-                    account, 
-                    models: [], 
-                    error: `Database is still synced to ${email}. Refreshing App...` 
-                };
-            }
+            const SQL = await this.loadSql();
+            const dbBuf = fs.readFileSync(account.statePath);
+            const mergedBuf = this.mergeWal(dbBuf, account.statePath + '-wal');
+            const db = new SQL.Database(mergedBuf);
 
-            const models = this.parseUserStatus(userStatusBuf);
-            // Update label in case account changed
-            account.label = email;
-            account.id = email;
-            return { account, models };
+            try {
+                const userStatusBuf = this.extractUserStatusBuf(db);
+
+                if (!userStatusBuf) {
+                    return { account, models: [], error: 'userStatus not found in DB' };
+                }
+
+                // account.id comes from userStatus email, so the quota data
+                // in userStatusBuf always belongs to this account. No email
+                // mismatch check needed — they're from the same source.
+                const models = this.parseUserStatus(userStatusBuf);
+                return { account, models };
+            } finally {
+                db.close();
+            }
         } catch (err: unknown) {
             return {
                 account,
@@ -189,109 +192,59 @@ export class QuotaFetcher {
         }
     }
 
-    // ── Read User Info from SQLite with Deep Discovery ────────────────────────
+    // ── Internal helpers ──────────────────────────────────────────────────────
 
-    private async readUserStatus(statePath: string): Promise<{
-        email: string;
-        userStatusBuf: Buffer;
-    }> {
+    private async loadSql(): Promise<import('sql.js').SqlJsStatic> {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const initSqlJs = require('sql.js') as typeof import('sql.js');
         const sqlJsPath = require.resolve('sql.js');
         const wasmPath = path.join(path.dirname(sqlJsPath), 'sql-wasm.wasm');
         const wasmBinary = fs.readFileSync(wasmPath);
-        const SQL = await initSqlJs({ wasmBinary: wasmBinary.buffer as ArrayBuffer });
-        const db = new SQL.Database(fs.readFileSync(statePath));
+        return initSqlJs({ wasmBinary: wasmBinary.buffer as ArrayBuffer });
+    }
 
+    /**
+     * Extract the email stored inside antigravityUnifiedStateSync.userStatus.
+     * This is the account whose quota data is currently in the DB.
+     */
+    private extractEmailFromUserStatus(db: import('sql.js').Database): string | null {
         try {
-            let bestQuotaBuf: Buffer | null = null;
-            let bestEmail: string = 'unknown';
+            const buf = this.extractUserStatusBuf(db);
+            if (!buf) { return null; }
+            const us = decode(buf);
+            return getBufStr(us, 7) ?? getBufStr(us, 3) ?? null;
+        } catch {
+            return null;
+        }
+    }
 
-            const scanRes = db.exec("SELECT key, value FROM ItemTable");
-            
-            const ensureBuffer = (v: any): Buffer | null => {
-                if (v instanceof Uint8Array) return Buffer.from(v);
-                if (typeof v === 'string') {
-                    if (/^[A-Za-z0-9+/=]{40,}$/.test(v)) {
-                        try { return Buffer.from(v, 'base64'); } catch {}
-                    }
-                    return Buffer.from(v, 'utf8');
-                }
-                return null;
-            };
+    /**
+     * Decode the nested proto structure to get the raw userStatus buffer.
+     * Structure: base64 → proto(f1 → proto(f2 → proto(f1=base64str → userStatus)))
+     */
+    private extractUserStatusBuf(db: import('sql.js').Database): Buffer | null {
+        try {
+            const r = db.exec(
+                "SELECT value FROM ItemTable WHERE key = 'antigravityUnifiedStateSync.userStatus' LIMIT 1"
+            );
+            if (!r.length || !r[0].values.length) { return null; }
 
-            const findQuotaRecursive = (buf: Buffer, depth: number): Buffer | null => {
-                if (depth > 5) return null;
-                const f = decode(buf);
-                if (f[33]) return buf;
+            const outer = Buffer.from(String(r[0].values[0][0]), 'base64');
+            const top = decode(outer);
+            const l1buf = getBuf(top, 1);
+            if (!l1buf) { return null; }
 
-                for (const fields of Object.values(f)) {
-                    for (const v of fields) {
-                        if (Buffer.isBuffer(v)) {
-                            // Try as raw
-                            const res = findQuotaRecursive(v, depth + 1);
-                            if (res) return res;
-                            // Try as base64 string
-                            const s = v.toString('utf8');
-                            if (/^[A-Za-z0-9+/=]{40,}$/.test(s)) {
-                                try {
-                                    const b2 = Buffer.from(s, 'base64');
-                                    const res2 = findQuotaRecursive(b2, depth + 1);
-                                    if (res2) return res2;
-                                } catch {}
-                            }
-                        }
-                    }
-                }
-                return null;
-            };
+            const l1 = decode(l1buf);
+            const l2buf = getBuf(l1, 2);
+            if (!l2buf) { return null; }
 
-            if (scanRes.length && scanRes[0].values.length) {
-                for (const row of scanRes[0].values) {
-                    const key = String(row[0]);
-                    const valRaw = row[1];
-                    const buf = ensureBuffer(valRaw);
-                    if (!buf) continue;
+            const l2 = decode(l2buf);
+            const b64buf = getBuf(l2, 1);
+            if (!b64buf) { return null; }
 
-                    // 1. Detect Email
-                    const valStr = buf.toString('utf8');
-                    if (valStr.includes('@') && bestEmail === 'unknown') {
-                        const m = valStr.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-                        if (m) bestEmail = m[0];
-                    }
-
-                    // 2. Detect Quota Buf
-                    const quota = findQuotaRecursive(buf, 0);
-                    if (quota) {
-                        // If multiple found, prefer the bigger one
-                        if (!bestQuotaBuf || quota.length > bestQuotaBuf.length) {
-                            bestQuotaBuf = quota;
-                        }
-                    }
-                }
-            }
-
-            if (!bestQuotaBuf) {
-                console.error('[OrbitHub] No quota buffer found in DB scan.');
-                throw new Error('Could not find usage data in database.');
-            }
-
-            // Final identity extraction from the buffer if still unknown
-            if (bestEmail === 'unknown') {
-                const us = decode(bestQuotaBuf);
-                const candidateFields = [7, 10, 11, 3, 1, 4];
-                for (const f of candidateFields) {
-                    const val = getBufStr(us, f);
-                    if (val && val.includes('@')) {
-                        bestEmail = val;
-                        break;
-                    }
-                }
-            }
-
-            return { email: bestEmail, userStatusBuf: bestQuotaBuf };
-        } finally {
-            if (db) db.close();
+            return Buffer.from(b64buf.toString('utf8'), 'base64');
+        } catch {
+            return null;
         }
     }
 
@@ -309,6 +262,7 @@ export class QuotaFetcher {
 
         for (const blob of modelBlobs) {
             const f = decode(blob);
+
             const nameBuf = getBuf(f, 1);
             if (!nameBuf) { continue; }
             const displayName = nameBuf.toString('utf8');
@@ -320,24 +274,31 @@ export class QuotaFetcher {
             const modelInfo = MODELS.find(m => m.id === modelId);
             if (!modelInfo) { continue; }
 
+            // field2.field1 = remaining credits
             const f2buf = getBuf(f, 2);
             const f2 = f2buf ? decode(f2buf) : {};
             const remaining = getNum(f2, 1) ?? 0;
 
-            let pctRemaining: number | null = null;
+            // field15: contains float (pct remaining) and reset timestamp
+            let pctRemaining = 0;
             let resetAt = now + 7 * 24 * 60 * 60 * 1000;
 
             const f15buf = getBuf(f, 15);
             if (f15buf) {
+                // Walk field15 manually to extract float and timestamp
                 let i = 0;
-                while (i < f15buf.length - 4) {
-                    const tag = f15buf[i];
+                while (i < f15buf.length) {
+                    if (i >= f15buf.length) { break; }
+                    const tag = f15buf[i++];
                     const fn = tag >> 3;
                     const wt = tag & 7;
-                    i++;
+
                     if (wt === 5 && fn === 1) {
-                        pctRemaining = f15buf.readFloatLE(i);
-                        i += 4;
+                        // 32-bit float = percentage remaining
+                        if (i + 4 <= f15buf.length) {
+                            pctRemaining = f15buf.readFloatLE(i);
+                            i += 4;
+                        }
                     } else if (wt === 2) {
                         let len = 0, shift = 0, b = 0;
                         do { b = f15buf[i++]; len |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
@@ -347,53 +308,92 @@ export class QuotaFetcher {
                             const secs = getNum(subf, 1);
                             if (secs && secs > 0) {
                                 resetAt = secs * 1000;
+                                // Roll forward if in the past
                                 if (resetAt < now) {
-                                    const dCycle = 7 * 24 * 60 * 60 * 1000;
-                                    const nCycle = 9 * 24 * 60 * 60 * 1000;
-                                    const tCycle = 10 * 24 * 60 * 60 * 1000;
-                                    
-                                    let nextReset = resetAt;
-                                    while (nextReset < now) nextReset += dCycle;
-
-                                    // If reset is too soon (< 2d) and potentially off, try cycles
-                                    if (nextReset < now + 2 * 24 * 60 * 60 * 1000) {
-                                        let next9 = resetAt;
-                                        while (next9 < now) next9 += nCycle;
-                                        if (next9 > nextReset) nextReset = next9;
-                                        
-                                        let next10 = resetAt;
-                                        while (next10 < now) next10 += tCycle;
-                                        if (next10 > nextReset) nextReset = next10;
-                                    }
-                                    resetAt = nextReset;
+                                    const cycle = modelId === 'gemini-3-flash'
+                                        ? 5 * 60 * 60 * 1000
+                                        : 7 * 24 * 60 * 60 * 1000;
+                                    while (resetAt < now) { resetAt += cycle; }
                                 }
                             }
                         }
                         i += len;
                     } else if (wt === 0) {
+                        // varint — skip
                         let b = 0;
-                        do { b = f15buf[i++]; } while (b & 0x80);
-                    } else break;
+                        do { if (i >= f15buf.length) { break; } b = f15buf[i++]; } while (b & 0x80);
+                    } else if (wt === 1) {
+                        i += 8;
+                    } else {
+                        break;
+                    }
                 }
             }
 
-            let total: number;
-            if (pctRemaining !== null && pctRemaining > 0) {
-                total = Math.round(remaining / pctRemaining);
-            } else {
-                total = Math.max(remaining, 1280);
-            }
+            // Derive total from pct: total = remaining / pctRemaining
+            const total = pctRemaining > 0.001
+                ? Math.round(remaining / pctRemaining)
+                : Math.max(remaining, 1280);
+
+            const finalPct = pctRemaining > 0
+                ? Math.round(pctRemaining * 100)
+                : 0;
 
             results.push({
                 modelId,
                 modelName: modelInfo.name,
                 remaining,
                 total,
+                pctRemaining: finalPct,
                 resetAt,
                 fetchedAt: now,
             });
         }
+
         return results;
+    }
+
+    private mergeWal(dbBuf: Buffer, walPath: string): Buffer {
+        if (!fs.existsSync(walPath)) { return dbBuf; }
+        try {
+            const walBuf = fs.readFileSync(walPath);
+            if (walBuf.length < 32) { return dbBuf; }
+            
+            const magic = walBuf.readUInt32BE(0);
+            const magicLE = walBuf.readUInt32LE(0);
+            let isLittleEndian = true;
+            if (magic === 0x377f0682 || magic === 0x377f0683) { isLittleEndian = false; }
+            else if (magicLE === 0x377f0682 || magicLE === 0x377f0683) { isLittleEndian = true; }
+            else { return dbBuf; }
+
+            const pageSize = isLittleEndian ? walBuf.readUInt32LE(8) : walBuf.readUInt32BE(8);
+            if (pageSize === 0 || (pageSize & (pageSize - 1)) !== 0) { return dbBuf; }
+
+            let dbCopy = Buffer.from(dbBuf);
+            let offset = 32;
+            const len = walBuf.length;
+            
+            while (offset + 24 <= len) {
+                const pageNum = isLittleEndian ? walBuf.readUInt32LE(offset) : walBuf.readUInt32BE(offset);
+                if (pageNum === 0) { break; }
+                if (offset + 24 + pageSize > len) { break; }
+
+                const frameData = walBuf.subarray(offset + 24, offset + 24 + pageSize);
+                const targetOffset = (pageNum - 1) * pageSize;
+                
+                if (targetOffset + pageSize > dbCopy.length) {
+                    const newBuf = Buffer.alloc(targetOffset + pageSize);
+                    dbCopy.copy(newBuf);
+                    dbCopy = newBuf;
+                }
+                
+                frameData.copy(dbCopy, targetOffset);
+                offset += 24 + pageSize;
+            }
+            return dbCopy;
+        } catch {
+            return dbBuf;
+        }
     }
 
     static defaultStatePath(): string {
