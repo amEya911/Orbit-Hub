@@ -6,6 +6,7 @@ export interface Account {
     authEmail?: string;     // Google OAuth email from authStatus (for switch detection)
     statePath: string;
     isActive: boolean;
+    syncError?: string;
 }
 
 export interface CachedQuota {

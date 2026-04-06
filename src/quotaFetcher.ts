@@ -44,6 +44,18 @@ export interface FetchResult {
     account: ActiveAccountInfo;
     models: RawModelQuota[];
     error?: string;
+    syncPending?: boolean;
+}
+
+interface AuthStatusSnapshot {
+    email?: string;
+    userStatusProtoBinaryBase64?: string;
+}
+
+interface UserStatusCandidate {
+    source: 'unifiedStateSync' | 'authStatus';
+    email: string | null;
+    buf: Buffer;
 }
 
 // ── Protobuf decoder ──────────────────────────────────────────────────────────
@@ -102,10 +114,11 @@ export class QuotaFetcher {
 
     // ── Switch-acceleration state ─────────────────────────────────────────────
     //
-    // authEmail (from antigravityAuthStatus) updates the instant the user
-    // switches accounts.  userEmail (from userStatus proto) typically only
-    // refreshes when Anti-Gravity restarts, because Anti-Gravity checkpoints
-    // userStatus to disk on shutdown rather than continuously while running.
+    // authEmail (from the live session or antigravityAuthStatus) updates the
+    // instant the user switches accounts. The quota-owning userStatus blobs on
+    // disk can lag behind that switch, so Orbit Hub needs to detect the auth
+    // change immediately and keep retrying until one of the stored userStatus
+    // snapshots matches the new account.
     //
     // orbitHubProvider resolves its switchPending state only when active.id
     // changes from the old value to a new one.  Without intervention, active.id
@@ -147,20 +160,19 @@ export class QuotaFetcher {
                     authEmail = liveAuthEmail;
                 }
 
+                const authStatus = this.extractAuthStatus(db);
+
                 // Step 1: Read authStatus email — updates INSTANTLY on switch.
                 if (authEmail === 'unknown') {
-                    const authRes = db.exec(
-                        "SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus' LIMIT 1"
-                    );
-                    if (authRes.length && authRes[0].values.length) {
-                        const parsed = JSON.parse(String(authRes[0].values[0][0]));
-                        if (parsed.email) { authEmail = parsed.email; }
-                    }
+                    const dbAuthEmail = this.extractEmailCandidate(authStatus?.email);
+                    if (dbAuthEmail) { authEmail = dbAuthEmail; }
                 }
 
-                // Step 2: Read userStatus email — the subscription account that
-                // owns the quota data.  May only update on restart.
-                const userStatusEmail = this.extractEmailFromUserStatus(db);
+                // Step 2: Read the freshest userStatus email we have on disk.
+                const userStatusEmail = this.resolveUserStatusEmail(
+                    this.extractUserStatusCandidates(db, authStatus),
+                    authEmail,
+                );
                 if (userStatusEmail && userStatusEmail !== 'unknown') {
                     userEmail = userStatusEmail;
                 }
@@ -217,9 +229,9 @@ export class QuotaFetcher {
     }
 
     /**
-     * Fetch quota for the active account.  Returns empty models when the
-     * userStatus on disk belongs to a different account (switch in progress),
-     * rather than silently returning the wrong account's quota.
+     * Fetch quota for the active account. Returns empty models when the stored
+     * userStatus snapshots still belong to another account, rather than showing
+     * the wrong quota under the newly active email.
      */
     async fetchQuota(account: ActiveAccountInfo): Promise<FetchResult> {
         try {
@@ -228,25 +240,17 @@ export class QuotaFetcher {
             const db = new SQL.Database(mergedBuf);
 
             try {
-                // ── Stale-quota guard ─────────────────────────────────────────
-                // The accelerator sets account.id = new authEmail while userStatus
-                // on disk still contains the old account's data.  Associating the
-                // old quota with the new account id would show wrong numbers.
-                const diskAccountEmail = this.extractEmailFromUserStatus(db);
-                if (diskAccountEmail && diskAccountEmail !== account.id) {
+                const userStatus = this.extractMatchingUserStatus(db, account.id);
+                if (!userStatus) {
                     return {
                         account,
                         models: [],
                         error: 'userStatus syncing for new account',
+                        syncPending: true,
                     };
                 }
 
-                const userStatusBuf = this.extractUserStatusBuf(db);
-                if (!userStatusBuf) {
-                    return { account, models: [], error: 'userStatus not found in DB' };
-                }
-
-                const models = this.parseUserStatus(userStatusBuf);
+                const models = this.parseUserStatus(userStatus.buf);
                 return { account, models };
             } finally {
                 db.close();
@@ -308,13 +312,13 @@ export class QuotaFetcher {
         const providers = ['antigravity_auth', 'antigravity', 'google'];
 
         for (const provider of providers) {
-            const accountEmail = await this.detectAuthEmailFromAccounts(provider);
-            if (accountEmail) { return accountEmail; }
+            const sessionEmail = await this.detectAuthEmailFromSessions(provider);
+            if (sessionEmail) { return sessionEmail; }
         }
 
         for (const provider of providers) {
-            const sessionEmail = await this.detectAuthEmailFromSessions(provider);
-            if (sessionEmail) { return sessionEmail; }
+            const accountEmail = await this.detectAuthEmailFromAccounts(provider);
+            if (accountEmail) { return accountEmail; }
         }
 
         return null;
@@ -323,9 +327,14 @@ export class QuotaFetcher {
     private async detectAuthEmailFromAccounts(provider: string): Promise<string | null> {
         try {
             const accounts = await vscode.authentication.getAccounts(provider);
+            const uniqueEmails = new Set<string>();
             for (const account of accounts) {
                 const email = this.extractEmailCandidate(account.label) ?? this.extractEmailCandidate(account.id);
-                if (email) { return email; }
+                if (email) { uniqueEmails.add(email); }
+            }
+
+            if (uniqueEmails.size === 1) {
+                return Array.from(uniqueEmails)[0];
             }
         } catch {
             // Provider may not exist in this Anti-Gravity build.
@@ -389,12 +398,83 @@ export class QuotaFetcher {
         return null;
     }
 
-    private extractEmailFromUserStatus(db: import('sql.js').Database): string | null {
+    private extractAuthStatus(db: import('sql.js').Database): AuthStatusSnapshot | null {
         try {
-            const buf = this.extractUserStatusBuf(db);
-            if (!buf) { return null; }
+            const authRes = db.exec(
+                "SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus' LIMIT 1"
+            );
+            if (!authRes.length || !authRes[0].values.length) { return null; }
+            return JSON.parse(String(authRes[0].values[0][0])) as AuthStatusSnapshot;
+        } catch {
+            return null;
+        }
+    }
+
+    private extractEmailFromUserStatusBuf(buf: Buffer): string | null {
+        try {
             const us = decode(buf);
-            return getBufStr(us, 7) ?? getBufStr(us, 3) ?? null;
+            return this.extractEmailCandidate(getBufStr(us, 7) ?? getBufStr(us, 3) ?? undefined);
+        } catch {
+            return null;
+        }
+    }
+
+    private extractUserStatusCandidates(
+        db: import('sql.js').Database,
+        authStatus = this.extractAuthStatus(db),
+    ): UserStatusCandidate[] {
+        const candidates: UserStatusCandidate[] = [];
+
+        const unifiedBuf = this.extractUnifiedUserStatusBuf(db);
+        if (unifiedBuf) {
+            candidates.push({
+                source: 'unifiedStateSync',
+                email: this.extractEmailFromUserStatusBuf(unifiedBuf),
+                buf: unifiedBuf,
+            });
+        }
+
+        const authStatusBuf = this.extractAuthStatusUserStatusBuf(authStatus);
+        if (authStatusBuf) {
+            candidates.push({
+                source: 'authStatus',
+                email: this.extractEmailFromUserStatusBuf(authStatusBuf)
+                    ?? this.extractEmailCandidate(authStatus?.email),
+                buf: authStatusBuf,
+            });
+        }
+
+        return candidates;
+    }
+
+    private extractMatchingUserStatus(
+        db: import('sql.js').Database,
+        accountId: string,
+    ): UserStatusCandidate | null {
+        const candidates = this.extractUserStatusCandidates(db);
+        return candidates.find(candidate => candidate.email === accountId) ?? null;
+    }
+
+    private resolveUserStatusEmail(
+        candidates: UserStatusCandidate[],
+        authEmail: string,
+    ): string | null {
+        if (authEmail !== 'unknown') {
+            const authMatched = candidates.find(candidate => candidate.email === authEmail);
+            if (authMatched?.email) { return authMatched.email; }
+        }
+
+        const unified = candidates.find(candidate => candidate.source === 'unifiedStateSync' && candidate.email);
+        if (unified?.email) { return unified.email; }
+
+        return candidates.find(candidate => candidate.email)?.email ?? null;
+    }
+
+    private extractAuthStatusUserStatusBuf(authStatus: AuthStatusSnapshot | null): Buffer | null {
+        try {
+            const raw = authStatus?.userStatusProtoBinaryBase64;
+            if (!raw) { return null; }
+            return Buffer.from(raw, 'base64');
         } catch {
             return null;
         }
@@ -404,7 +484,7 @@ export class QuotaFetcher {
      * Decode the nested proto structure to get the raw userStatus buffer.
      * Structure: base64 → proto(f1 → proto(f2 → proto(f1=base64str → userStatus)))
      */
-    private extractUserStatusBuf(db: import('sql.js').Database): Buffer | null {
+    private extractUnifiedUserStatusBuf(db: import('sql.js').Database): Buffer | null {
         try {
             const r = db.exec(
                 "SELECT value FROM ItemTable WHERE key = 'antigravityUnifiedStateSync.userStatus' LIMIT 1"

@@ -1,5 +1,6 @@
 {
   "name": "orbit-hub",
+  "publisher": "ameyakulkarni",
   "displayName": "Orbit Hub",
   "description": "Multi-account quota dashboard for Anti-Gravity IDE",
   "version": "0.1.0",
@@ -52,7 +53,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
-    "package": "vsce package"
+    "package": "vsce package",
+    "install:local": "node ./scripts/install-local.js"
   },
   "dependencies": {
     "sql.js": "^1.12.0"

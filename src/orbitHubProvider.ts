@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
-import { AccountManager, ModelCache } from './accountManager';
+import { AccountManager } from './accountManager';
 import { QuotaFetcher, MODELS } from './quotaFetcher';
 
 export class OrbitHubProvider implements vscode.WebviewViewProvider {
@@ -11,6 +11,11 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
     private switchPending = false;
     /** The userStatus account id that was active before the detected switch */
     private preTransitionUserId: string | null = null;
+    /** Short burst retries after an account switch so quota appears without waiting for the 25s poll */
+    private syncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    private syncRetryUntil = 0;
+    private readonly syncRetryIntervalMs = 2_000;
+    private readonly syncRetryWindowMs = 60_000;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -54,6 +59,7 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 if (this.lastAuthEmail !== null && active.authEmail !== this.lastAuthEmail) {
                     this.switchPending = true;
                     this.preTransitionUserId = active.id; // still the OLD userStatus email
+                    this.startSyncRetryWindow();
                 }
                 this.lastAuthEmail = active.authEmail;
 
@@ -62,17 +68,10 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 // Mark everything inactive and show "switching" state.
                 if (this.switchPending && active.id === this.preTransitionUserId) {
                     for (const acc of accounts) { acc.isActive = false; }
-                    // Inject a transient indicator for the UI
-                    (accounts as any).__switchPending = true;
+                    this.startSyncRetryWindow();
                     await this.context.globalState.update('orbitHub.accounts', accounts);
                     this.sendState();
                     return;
-                }
-
-                // If switch was pending but userStatus now has a NEW email → transition complete
-                if (this.switchPending) {
-                    this.switchPending = false;
-                    this.preTransitionUserId = null;
                 }
 
                 // ── Normal account update flow ────────────────────────────
@@ -107,8 +106,9 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 // Store sync error if any (for UI display)
                 const accIdx = accounts.findIndex(a => a.id === active.id);
                 if (accIdx >= 0) {
-                    (accounts[accIdx] as any).syncError = result.error;
+                    accounts[accIdx].syncError = result.error;
                 }
+                await this.context.globalState.update('orbitHub.accounts', accounts);
 
                 if (result.models.length > 0) {
                     await this.accountManager.updateCachedQuota({
@@ -116,11 +116,23 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                         models: result.models,
                         fetchedAt: Date.now(),
                     });
+                    this.switchPending = false;
+                    this.preTransitionUserId = null;
+                    this.stopSyncRetryWindow();
+                } else if (result.syncPending) {
+                    this.startSyncRetryWindow();
+                } else {
+                    this.switchPending = false;
+                    this.preTransitionUserId = null;
+                    this.stopSyncRetryWindow();
                 }
             } else {
                 // System might be offline or app closed
                 for (const acc of accounts) { acc.isActive = false; }
                 await this.context.globalState.update('orbitHub.accounts', accounts);
+                this.switchPending = false;
+                this.preTransitionUserId = null;
+                this.stopSyncRetryWindow();
             }
         } catch (err) {
             console.error('[OrbitHub] Refresh failed:', err);
@@ -134,8 +146,16 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
 
         const accounts = this.accountManager.getAccounts();
         const allCached = this.accountManager.getAllCachedQuotas();
+        const visibleAccounts = accounts
+            .filter(acc => acc.isActive || allCached[acc.id])
+            .sort((a, b) => {
+                if (a.isActive !== b.isActive) { return a.isActive ? -1 : 1; }
+                const aFetchedAt = allCached[a.id]?.fetchedAt ?? 0;
+                const bFetchedAt = allCached[b.id]?.fetchedAt ?? 0;
+                return bFetchedAt - aFetchedAt;
+            });
 
-        const payload = accounts.map(acc => {
+        const payload = visibleAccounts.map(acc => {
             const cache = allCached[acc.id] ?? null;
 
             const models = MODELS.map(m => {
@@ -194,6 +214,33 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
         });
 
         void this.view.webview.postMessage({ type: 'state', accounts: payload, models: MODELS });
+    }
+
+    private startSyncRetryWindow(): void {
+        const nextDeadline = Date.now() + this.syncRetryWindowMs;
+        if (nextDeadline > this.syncRetryUntil) {
+            this.syncRetryUntil = nextDeadline;
+        }
+        this.scheduleSyncRetry();
+    }
+
+    private stopSyncRetryWindow(): void {
+        this.syncRetryUntil = 0;
+        if (this.syncRetryTimer !== null) {
+            clearTimeout(this.syncRetryTimer);
+            this.syncRetryTimer = null;
+        }
+    }
+
+    private scheduleSyncRetry(): void {
+        if (this.syncRetryTimer !== null || Date.now() >= this.syncRetryUntil) {
+            return;
+        }
+
+        this.syncRetryTimer = setTimeout(() => {
+            this.syncRetryTimer = null;
+            void this.refresh();
+        }, this.syncRetryIntervalMs);
     }
 
     private buildHtml(webview: vscode.Webview): string {
