@@ -100,6 +100,32 @@ function getBufStr(f: ProtoFields, field: number): string | null {
 
 export class QuotaFetcher {
 
+    // ── Switch-acceleration state ─────────────────────────────────────────────
+    //
+    // authEmail (from antigravityAuthStatus) updates the instant the user
+    // switches accounts.  userEmail (from userStatus proto) typically only
+    // refreshes when Anti-Gravity restarts, because Anti-Gravity checkpoints
+    // userStatus to disk on shutdown rather than continuously while running.
+    //
+    // orbitHubProvider resolves its switchPending state only when active.id
+    // changes from the old value to a new one.  Without intervention, active.id
+    // (= userEmail) never changes during a live session, so the "switching…"
+    // overlay is shown forever.
+    //
+    // The acceleration logic makes active.id flip one poll after the authEmail
+    // change is first detected:
+    //
+    //   Poll where authEmail FIRST changes:
+    //     → return id = old userEmail   so orbitHubProvider records it as
+    //                                   preTransitionUserId
+    //
+    //   All subsequent polls while authEmail ≠ userEmail:
+    //     → return id = new authEmail   active.id ≠ preTransitionUserId
+    //                                   → orbitHubProvider resolves the switch
+    //
+    private _lastSeenAuthEmail: string | null = null;
+    private _pendingNewAuthEmail: string | null = null;
+
     /**
      * Detect the currently active account by reading antigravityAuthStatus
      * (updates immediately on login) and cross-referencing with userStatus.
@@ -110,16 +136,13 @@ export class QuotaFetcher {
 
         try {
             const SQL = await this.loadSql();
-            const dbBuf = fs.readFileSync(statePath);
-            const mergedBuf = this.mergeWal(dbBuf, statePath + '-wal');
+            const mergedBuf = this.readAndMerge(statePath);
             const db = new SQL.Database(mergedBuf);
             let authEmail = 'unknown';
             let userEmail = 'unknown';
 
             try {
                 // Step 1: Read authStatus email — updates INSTANTLY on switch.
-                // This is the Google OAuth credential email, used to detect
-                // when the user switches accounts.
                 const authRes = db.exec(
                     "SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus' LIMIT 1"
                 );
@@ -129,8 +152,7 @@ export class QuotaFetcher {
                 }
 
                 // Step 2: Read userStatus email — the subscription account that
-                // OWNS the quota data. May differ from authEmail (different
-                // identity layers). Updates lazily (30–60s after switch).
+                // owns the quota data.  May only update on restart.
                 const userStatusEmail = this.extractEmailFromUserStatus(db);
                 if (userStatusEmail && userStatusEmail !== 'unknown') {
                     userEmail = userStatusEmail;
@@ -139,11 +161,41 @@ export class QuotaFetcher {
                 db.close();
             }
 
-            // Account identity = userStatus email (quota data belongs to it).
-            // Fall back to authStatus email only if userStatus is unavailable.
-            const id = userEmail !== 'unknown' ? userEmail
-                : authEmail !== 'unknown' ? authEmail
-                    : null;
+            // ── Switch-acceleration ───────────────────────────────────────────
+            const authJustChanged = this._lastSeenAuthEmail !== null
+                && authEmail !== 'unknown'
+                && authEmail !== this._lastSeenAuthEmail;
+
+            if (authJustChanged) {
+                this._pendingNewAuthEmail = authEmail;
+            }
+            if (authEmail !== 'unknown') {
+                this._lastSeenAuthEmail = authEmail;
+            }
+
+            let id: string | null;
+            if (
+                !authJustChanged                                 // not the first-change poll
+                && this._pendingNewAuthEmail !== null
+                && authEmail === this._pendingNewAuthEmail       // new authEmail is stable
+                && userEmail !== 'unknown'
+                && userEmail !== authEmail                       // userStatus still stale
+            ) {
+                // Return new authEmail so orbitHubProvider sees the id flip.
+                id = authEmail;
+            } else {
+                // Normal path, or the exact poll where authEmail just changed.
+                // Return old userEmail so preTransitionUserId gets the old value.
+                id = userEmail !== 'unknown' ? userEmail
+                    : authEmail !== 'unknown' ? authEmail
+                        : null;
+                // Clear once userStatus catches up
+                if (this._pendingNewAuthEmail !== null
+                    && (userEmail === authEmail || authEmail === 'unknown')) {
+                    this._pendingNewAuthEmail = null;
+                }
+            }
+
             if (!id) { return null; }
 
             return {
@@ -158,26 +210,35 @@ export class QuotaFetcher {
     }
 
     /**
-     * Fetch quota for the active account. If userStatus hasn't synced yet
-     * for this account, returns empty models with a descriptive error.
+     * Fetch quota for the active account.  Returns empty models when the
+     * userStatus on disk belongs to a different account (switch in progress),
+     * rather than silently returning the wrong account's quota.
      */
     async fetchQuota(account: ActiveAccountInfo): Promise<FetchResult> {
         try {
             const SQL = await this.loadSql();
-            const dbBuf = fs.readFileSync(account.statePath);
-            const mergedBuf = this.mergeWal(dbBuf, account.statePath + '-wal');
+            const mergedBuf = this.readAndMerge(account.statePath);
             const db = new SQL.Database(mergedBuf);
 
             try {
-                const userStatusBuf = this.extractUserStatusBuf(db);
+                // ── Stale-quota guard ─────────────────────────────────────────
+                // The accelerator sets account.id = new authEmail while userStatus
+                // on disk still contains the old account's data.  Associating the
+                // old quota with the new account id would show wrong numbers.
+                const diskAccountEmail = this.extractEmailFromUserStatus(db);
+                if (diskAccountEmail && diskAccountEmail !== account.id) {
+                    return {
+                        account,
+                        models: [],
+                        error: 'userStatus syncing for new account',
+                    };
+                }
 
+                const userStatusBuf = this.extractUserStatusBuf(db);
                 if (!userStatusBuf) {
                     return { account, models: [], error: 'userStatus not found in DB' };
                 }
 
-                // account.id comes from userStatus email, so the quota data
-                // in userStatusBuf always belongs to this account. No email
-                // mismatch check needed — they're from the same source.
                 const models = this.parseUserStatus(userStatusBuf);
                 return { account, models };
             } finally {
@@ -194,6 +255,39 @@ export class QuotaFetcher {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
+    /**
+     * Read the database + WAL from disk, merge them, and return a buffer that
+     * sql.js can open reliably.
+     *
+     * WAL-mode downgrade — the key fix for stale data (Bugs 1 & 3):
+     *
+     * While Anti-Gravity is running, all writes land in the WAL file first.
+     * The main .vscdb file is only updated when SQLite checkpoints (on
+     * Anti-Gravity shutdown), which is why data always looks fresh after
+     * a restart.
+     *
+     * We manually merge WAL pages into a copy of the main file.  However,
+     * sql.js loads databases into an in-memory VFS that has no sidecar files.
+     * When the database header says write_version=2 (WAL mode), the SQLite
+     * engine inside sql.js tries to open the matching -wal file via that VFS.
+     * Finding nothing, it silently falls back to treating the database as if
+     * there is no WAL — meaning it reads only the unmerged pages from the main
+     * file and throws away everything we merged.
+     *
+     * Fix: after merging, patch header bytes 18–19 from 2 (WAL) to 1 (legacy
+     * journal).  sql.js then reads pages directly from the buffer we provide,
+     * which already contains the merged WAL data.
+     */
+    private readAndMerge(statePath: string): Buffer {
+        const dbBuf = fs.readFileSync(statePath);
+        const raw = this.mergeWal(dbBuf, statePath + '-wal');
+        // Always work on a fresh writable copy.
+        const buf = Buffer.from(raw);
+        // Downgrade WAL mode → legacy so sql.js reads our merged pages.
+        if (buf.length >= 20) { buf[18] = 1; buf[19] = 1; }
+        return buf;
+    }
+
     private async loadSql(): Promise<import('sql.js').SqlJsStatic> {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const initSqlJs = require('sql.js') as typeof import('sql.js');
@@ -203,10 +297,6 @@ export class QuotaFetcher {
         return initSqlJs({ wasmBinary: wasmBinary.buffer as ArrayBuffer });
     }
 
-    /**
-     * Extract the email stored inside antigravityUnifiedStateSync.userStatus.
-     * This is the account whose quota data is currently in the DB.
-     */
     private extractEmailFromUserStatus(db: import('sql.js').Database): string | null {
         try {
             const buf = this.extractUserStatusBuf(db);
@@ -274,18 +364,15 @@ export class QuotaFetcher {
             const modelInfo = MODELS.find(m => m.id === modelId);
             if (!modelInfo) { continue; }
 
-            // field2.field1 = remaining credits
             const f2buf = getBuf(f, 2);
             const f2 = f2buf ? decode(f2buf) : {};
             const remaining = getNum(f2, 1) ?? 0;
 
-            // field15: contains float (pct remaining) and reset timestamp
             let pctRemaining = 0;
             let resetAt = now + 7 * 24 * 60 * 60 * 1000;
 
             const f15buf = getBuf(f, 15);
             if (f15buf) {
-                // Walk field15 manually to extract float and timestamp
                 let i = 0;
                 while (i < f15buf.length) {
                     if (i >= f15buf.length) { break; }
@@ -294,7 +381,6 @@ export class QuotaFetcher {
                     const wt = tag & 7;
 
                     if (wt === 5 && fn === 1) {
-                        // 32-bit float = percentage remaining
                         if (i + 4 <= f15buf.length) {
                             pctRemaining = f15buf.readFloatLE(i);
                             i += 4;
@@ -308,7 +394,6 @@ export class QuotaFetcher {
                             const secs = getNum(subf, 1);
                             if (secs && secs > 0) {
                                 resetAt = secs * 1000;
-                                // Roll forward if in the past
                                 if (resetAt < now) {
                                     const cycle = modelId === 'gemini-3-flash'
                                         ? 5 * 60 * 60 * 1000
@@ -319,7 +404,6 @@ export class QuotaFetcher {
                         }
                         i += len;
                     } else if (wt === 0) {
-                        // varint — skip
                         let b = 0;
                         do { if (i >= f15buf.length) { break; } b = f15buf[i++]; } while (b & 0x80);
                     } else if (wt === 1) {
@@ -330,7 +414,6 @@ export class QuotaFetcher {
                 }
             }
 
-            // Derive total from pct: total = remaining / pctRemaining
             const total = pctRemaining > 0.001
                 ? Math.round(remaining / pctRemaining)
                 : Math.max(remaining, 1280);
@@ -353,58 +436,38 @@ export class QuotaFetcher {
         return results;
     }
 
-    /**
-     * Merge WAL frames into a copy of the database buffer.
-     *
-     * BUG FIX (Bugs 1 & 3): SQLite reuses the WAL file from the start after
-     * each checkpoint, writing a new salt pair into the WAL header. Frames
-     * from a previous WAL cycle that still exist beyond the end of the current
-     * write position carry the OLD salt. Without salt validation, those stale
-     * frames were being replayed on top of freshly-checkpointed pages,
-     * reverting the database to an older state and making all live changes
-     * invisible until Anti-Gravity was restarted (which triggers a full
-     * checkpoint + WAL reset).
-     *
-     * Fix: read salt1/salt2 from the WAL header and stop as soon as a frame's
-     * salt differs — those frames belong to a previous WAL generation.
-     */
     private mergeWal(dbBuf: Buffer, walPath: string): Buffer {
         if (!fs.existsSync(walPath)) { return dbBuf; }
         try {
             const walBuf = fs.readFileSync(walPath);
             if (walBuf.length < 32) { return dbBuf; }
 
+            // All integers in the SQLite WAL file are stored big-endian.
+            // The magic LSB (0x82 vs 0x83) only signals which byte order was
+            // used for checksums; it does not affect field layout.
             const magic = walBuf.readUInt32BE(0);
-            const magicLE = walBuf.readUInt32LE(0);
-            let isLittleEndian = true;
-            if (magic === 0x377f0682 || magic === 0x377f0683) { isLittleEndian = false; }
-            else if (magicLE === 0x377f0682 || magicLE === 0x377f0683) { isLittleEndian = true; }
-            else { return dbBuf; }
+            if (magic !== 0x377f0682 && magic !== 0x377f0683) { return dbBuf; }
 
-            const read32 = (off: number): number =>
-                isLittleEndian ? walBuf.readUInt32LE(off) : walBuf.readUInt32BE(off);
-
-            const pageSize = read32(8);
+            const pageSize = walBuf.readUInt32BE(8);
             if (pageSize === 0 || (pageSize & (pageSize - 1)) !== 0) { return dbBuf; }
 
-            // Read the WAL-header salt pair.  Every valid frame in the current
-            // WAL generation must carry these same salts in its frame header
-            // (bytes 8–15 of each 24-byte frame header).
-            const walSalt1 = read32(16);
-            const walSalt2 = read32(20);
+            // Salt pair from the WAL header (offsets 16 and 20).
+            // Every valid frame in the current WAL generation copies these into
+            // its own frame header.  Frames with different salts belong to a
+            // previous WAL cycle and must be ignored.
+            const walSalt1 = walBuf.readUInt32BE(16);
+            const walSalt2 = walBuf.readUInt32BE(20);
 
             let dbCopy = Buffer.from(dbBuf);
-            let offset = 32; // first frame starts right after the 32-byte WAL header
+            let offset = 32;
             const len = walBuf.length;
 
             while (offset + 24 <= len) {
-                const pageNum = read32(offset);
+                const pageNum = walBuf.readUInt32BE(offset);
                 if (pageNum === 0) { break; }
 
-                // Validate that this frame belongs to the current WAL cycle.
-                // Stale frames from a previous cycle have different salts — stop here.
-                const frameSalt1 = read32(offset + 8);
-                const frameSalt2 = read32(offset + 12);
+                const frameSalt1 = walBuf.readUInt32BE(offset + 8);
+                const frameSalt2 = walBuf.readUInt32BE(offset + 12);
                 if (frameSalt1 !== walSalt1 || frameSalt2 !== walSalt2) { break; }
 
                 if (offset + 24 + pageSize > len) { break; }
