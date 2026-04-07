@@ -37,6 +37,39 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 await this.refresh();
             } else if (msg.type === 'reset') {
                 await vscode.commands.executeCommand('orbitHub.reset');
+            } else if (msg.type === 'removeAccount') {
+                const { id } = msg as { type: 'removeAccount', id: string };
+                const accounts = this.accountManager.getAccounts();
+                const account = accounts.find(a => a.id === id);
+                if (!account) { return; }
+
+                if (account.isActive) {
+                    vscode.window.showInformationMessage(`Cannot remove the active account (${account.label}). Please switch accounts first.`);
+                    return;
+                }
+
+                const choice = await vscode.window.showWarningMessage(
+                    `Are you sure you want to remove account "${account.label}"? This will also clear its cached quota data.`,
+                    { modal: true },
+                    'Remove'
+                );
+
+                if (choice === 'Remove') {
+                    await this.accountManager.removeAccount(id);
+                    await this.refresh();
+                }
+            } else if (msg.type === 'reorderAccounts') {
+                const { ids } = msg as { type: 'reorderAccounts', ids: string[] };
+                const accounts = this.accountManager.getAccounts();
+                const reordered = ids.map(id => accounts.find(a => a.id === id)).filter((a): a is any => !!a);
+                
+                // Add any accounts that were missing from the reorder list (safety)
+                for (const acc of accounts) {
+                    if (!ids.includes(acc.id)) { reordered.push(acc); }
+                }
+
+                await this.context.globalState.update('orbitHub.accounts', reordered);
+                // No need to refresh full state, just notify views if any (though currently only one)
             }
         });
     }
@@ -47,6 +80,7 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
     }
 
     async refresh(): Promise<void> {
+        this.sendState();
         try {
             const active = await this.quotaFetcher.detectActiveAccount();
             const accounts = this.accountManager.getAccounts();
@@ -131,7 +165,7 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
         this.sendState();
     }
 
-    private sendState(): void {
+    public sendState(): void {
         if (!this.view) { return; }
 
         const accounts = this.accountManager.getAccounts();
@@ -151,13 +185,8 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 const isAuthAliasOnly = authAliasIds.has(acc.id) && acc.source !== 'unifiedStateSync';
                 if (isAuthAliasOnly) { return false; }
                 return acc.isActive || allCached[acc.id];
-            })
-            .sort((a, b) => {
-                if (a.isActive !== b.isActive) { return a.isActive ? -1 : 1; }
-                const aFetchedAt = allCached[a.id]?.fetchedAt ?? 0;
-                const bFetchedAt = allCached[b.id]?.fetchedAt ?? 0;
-                return bFetchedAt - aFetchedAt;
             });
+            // Automatic sorting removed to respect manually dragged order.
 
         const payload = visibleAccounts.map(acc => {
             const cache = allCached[acc.id] ?? null;

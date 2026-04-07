@@ -3,6 +3,10 @@
   "publisher": "ameyakulkarni",
   "displayName": "Orbit Hub",
   "description": "Multi-account quota dashboard for Anti-Gravity IDE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/amEya911/Orbit-Hub"
+  },
   "version": "0.1.0",
   "engines": {
     "vscode": "^1.85.0"

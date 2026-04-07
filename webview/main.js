@@ -10,6 +10,63 @@ window.addEventListener('DOMContentLoaded', () => {
     vscode.postMessage({ type: 'ready' });
     setInterval(tickCountdowns, 1000);
 
+    // Tooltip logic
+    const tooltip = document.createElement('div');
+    tooltip.className = 'quota-tooltip';
+    document.body.appendChild(tooltip);
+
+    document.addEventListener('mousemove', e => {
+        const track = e.target.closest('.bar-track');
+        if (track) {
+            const pct = track.dataset.pct;
+            tooltip.textContent = `${pct}% remaining`;
+            tooltip.classList.add('visible');
+            tooltip.style.left = `${e.clientX}px`;
+            tooltip.style.top = `${e.clientY}px`;
+        } else {
+            tooltip.classList.remove('visible');
+        }
+    });
+
+    // Drag-and-drop reordering
+    let dragSource = null;
+
+    document.addEventListener('dragstart', e => {
+        const section = e.target.closest('.account-section');
+        if (!section) { return; }
+        dragSource = section;
+        section.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+    });
+
+    document.addEventListener('dragover', e => {
+        e.preventDefault();
+        const section = e.target.closest('.account-section');
+        if (!section || section === dragSource) { return; }
+
+        const app = section.parentElement;
+        const rect = section.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+
+        if (e.clientY < midY) {
+            app.insertBefore(dragSource, section);
+        } else {
+            app.insertBefore(dragSource, section.nextSibling);
+        }
+    });
+
+    document.addEventListener('dragend', e => {
+        const section = e.target.closest('.account-section');
+        if (section) { section.classList.remove('dragging'); }
+        dragSource = null;
+
+        // Persist order
+        const app = document.getElementById('app');
+        const sections = Array.from(app.querySelectorAll('.account-section'));
+        const ids = sections.map(s => s.id.replace('acc-', ''));
+        vscode.postMessage({ type: 'reorderAccounts', ids });
+    });
+
     // Event Delegation for interactivity.
     //
     // BUG FIX (Bug 2): The refresh button (.refresh-btn) is rendered inside
@@ -29,18 +86,20 @@ window.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        const removeBtn = e.target.closest('.remove-btn');
+        if (removeBtn) {
+            e.stopPropagation();
+            const section = removeBtn.closest('.account-section');
+            const id = section.id.replace('acc-', '');
+            cmd_removeAccount(id);
+            return;
+        }
+
         const header = e.target.closest('.account-header');
         if (header) {
             const section = header.closest('.account-section');
             const id = section.id.replace('acc-', '');
             toggleAccount(id);
-            return;
-        }
-
-        const addManualBtn = e.target.closest('.add-manual-link');
-        if (addManualBtn) {
-            e.preventDefault();
-            cmd_addAccount();
             return;
         }
 
@@ -87,7 +146,6 @@ function buildNoData() {
       <div class="empty-icon">🛸</div>
       <div class="empty-title">Detecting account…</div>
       <div class="empty-sub">Make sure Anti-Gravity is running and you are logged in.</div>
-      <a href="#" class="add-manual-link" style="display: block; margin-top: 12px; color: var(--vscode-textLink-foreground); cursor: pointer;">Add account manually</a>
     </div>`;
 }
 
@@ -104,7 +162,7 @@ function buildAccount(entry) {
         : '';
 
     return `
-    <div class="account-section ${isCollapsed ? 'collapsed' : ''}" id="acc-${account.id}">
+    <div class="account-section ${isCollapsed ? 'collapsed' : ''}" id="acc-${account.id}" draggable="true">
       <div class="account-header">
         <div class="account-info">
           <span class="chevron">▼</span>
@@ -115,6 +173,7 @@ function buildAccount(entry) {
           ${account.syncError ? `<span class="sync-error" title="${esc(account.syncError)}">⏳ Syncing...</span>` : ''}
           ${fetchedStr ? `<span class="fetched-time">Updated ${fetchedStr}</span>` : ''}
           ${refreshHtml}
+          <button class="remove-btn" title="Remove Account">×</button>
         </div>
       </div>
       <div class="account-body">
@@ -160,7 +219,7 @@ function buildModelRow(m, isAccountActive) {
     const ageDays = m.dataAgeMs ? Math.floor(m.dataAgeMs / (24 * 60 * 60 * 1000)) : 0;
     const staleMsg = isStale ? (ageDays > 0 ? `Synced ${ageDays}d ago` : 'Synced recently') : '';
 
-    const warnIcon = (m.state === 'low' || isStale) ? `<span class="warn-icon" title="${isStale ? `Data is ${ageDays}d old. Open and refresh Anti-Gravity app to sync.` : ''}">⚠️</span>` : '';
+    const warnIcon = (m.state === 'low' || m.state === 'exhausted' || isStale) ? `<span class="warn-icon" title="${isStale ? `Data is ${ageDays}d old. Open and refresh Anti-Gravity app to sync.` : ''}">⚠️</span>` : '';
     const fetchedStr = m.fetchedAt ? new Date(m.fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
 
     const resetStr = `<span class="model-reset" 
@@ -184,7 +243,7 @@ function buildModelRow(m, isAccountActive) {
         </div>
         ${resetStr}
       </div>
-      <div class="bar-track">
+      <div class="bar-track" data-pct="${segmentsFilled * 20}">
         ${segmentsHtml}
       </div>
     </div>`;
@@ -229,11 +288,10 @@ function esc(str) {
 }
 function cmd_refresh() { vscode.postMessage({ type: 'refresh' }); }
 
-function cmd_addAccount(e) {
-    if (e) e.preventDefault();
-    vscode.postMessage({ type: 'addAccount' });
-}
-
 function cmd_reset() {
     vscode.postMessage({ type: 'reset' });
+}
+
+function cmd_removeAccount(id) {
+    vscode.postMessage({ type: 'removeAccount', id });
 }

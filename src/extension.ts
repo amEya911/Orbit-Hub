@@ -44,9 +44,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('orbitHub.reset', async () => {
-            await accountManager.resetAll();
-            await provider.refresh();
-            vscode.window.showInformationMessage('Orbit Hub: Data Reset');
+            const choice = await vscode.window.showWarningMessage(
+                "Are you sure you want to reset all Orbit Hub data? This will clear all accounts and cached quota information.",
+                { modal: true },
+                "Reset Everything"
+            );
+            if (choice === "Reset Everything") {
+                await accountManager.resetAll();
+                vscode.window.showInformationMessage('Orbit Hub: Data Reset');
+                void provider.refresh();
+            }
         })
     );
 

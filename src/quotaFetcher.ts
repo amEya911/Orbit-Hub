@@ -255,13 +255,27 @@ export class QuotaFetcher {
         return buf;
     }
 
+    private sqlPromise: Promise<import('sql.js').SqlJsStatic> | null = null;
+    private wasmBinary: ArrayBuffer | null = null;
+
     private async loadSql(): Promise<import('sql.js').SqlJsStatic> {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const initSqlJs = require('sql.js') as typeof import('sql.js');
-        const sqlJsPath = require.resolve('sql.js');
-        const wasmPath = path.join(path.dirname(sqlJsPath), 'sql-wasm.wasm');
-        const wasmBinary = fs.readFileSync(wasmPath);
-        return initSqlJs({ wasmBinary: wasmBinary.buffer as ArrayBuffer });
+        if (this.sqlPromise) { return this.sqlPromise; }
+
+        this.sqlPromise = (async () => {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const initSqlJs = require('sql.js') as typeof import('sql.js');
+            const sqlJsPath = require.resolve('sql.js');
+            const wasmPath = path.join(path.dirname(sqlJsPath), 'sql-wasm.wasm');
+            
+            if (!this.wasmBinary) {
+                const buf = fs.readFileSync(wasmPath);
+                this.wasmBinary = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+            }
+
+            return initSqlJs({ wasmBinary: this.wasmBinary });
+        })();
+
+        return this.sqlPromise;
     }
 
     private extractEmailCandidate(candidate: string | undefined): string | null {

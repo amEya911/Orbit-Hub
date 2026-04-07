@@ -49,9 +49,18 @@ body {
     align-items: center;
     justify-content: space-between;
     margin-bottom: 5px;
-    cursor: pointer;
+    cursor: grab;
     user-select: none;
     padding: 4px 0;
+}
+
+.account-header:active {
+    cursor: grabbing;
+}
+
+.account-section.dragging {
+    opacity: 0.4;
+    background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.1));
 }
 
 .account-info {
@@ -153,6 +162,25 @@ body {
     background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15));
 }
 
+.remove-btn {
+    background: transparent;
+    border: none;
+    color: var(--vscode-foreground);
+    cursor: pointer;
+    font-size: 16px;
+    opacity: 0.4;
+    padding: 2px 6px;
+    border-radius: 3px;
+    transition: opacity 0.1s, background 0.1s;
+    line-height: 1;
+}
+
+.remove-btn:hover {
+    opacity: 1;
+    background: var(--vscode-toolbar-hoverBackground, rgba(255, 0, 0, 0.1));
+    color: #f14c4c;
+}
+
 /* ── Section label ───────────────────────────────────────────────────────── */
 .model-quota-label {
     font-size: 10.5px;
@@ -212,6 +240,40 @@ body {
 
 .model-reset.muted {
     opacity: 0.4;
+}
+
+/* ── Tooltip ────────────────────────────────────────────────────────────── */
+.quota-tooltip {
+    position: fixed;
+    padding: 6px 10px;
+    background: #1e1e1e;
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 4px;
+    pointer-events: none;
+    z-index: 1000;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    white-space: nowrap;
+    transform: translate(-50%, -100%) translateY(-10px);
+}
+
+.quota-tooltip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border-width: 5px;
+    border-style: solid;
+    border-color: #1e1e1e transparent transparent transparent;
+}
+
+.quota-tooltip.visible {
+    opacity: 1;
 }
 
 /* ── Progress bar ────────────────────────────────────────────────────────── */
