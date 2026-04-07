@@ -5,12 +5,6 @@ import { QuotaFetcher, MODELS } from './quotaFetcher';
 
 export class OrbitHubProvider implements vscode.WebviewViewProvider {
     private view?: vscode.WebviewView;
-    /** Tracks the authStatus email across polls for switch detection */
-    private lastAuthEmail: string | null = null;
-    /** Set when authEmail changes — cleared when userStatus provides a new account */
-    private switchPending = false;
-    /** The userStatus account id that was active before the detected switch */
-    private preTransitionUserId: string | null = null;
     /** Short burst retries after an account switch so quota appears without waiting for the 25s poll */
     private syncRetryTimer: ReturnType<typeof setTimeout> | null = null;
     private syncRetryUntil = 0;
@@ -47,29 +41,32 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    handleAuthSessionChange(): void {
+        this.startSyncRetryWindow();
+        void this.refresh();
+    }
+
     async refresh(): Promise<void> {
         try {
             const active = await this.quotaFetcher.detectActiveAccount();
             const accounts = this.accountManager.getAccounts();
 
             if (active) {
-                // ── Switch detection via authEmail ─────────────────────────
-                // authStatus updates instantly on login/logout.
-                // If it changed since last poll, the user switched accounts.
-                if (this.lastAuthEmail !== null && active.authEmail !== this.lastAuthEmail) {
-                    this.switchPending = true;
-                    this.preTransitionUserId = active.id; // still the OLD userStatus email
-                    this.startSyncRetryWindow();
-                }
-                this.lastAuthEmail = active.authEmail;
+                const existingAccount = accounts.find(acc => acc.id === active.id);
+                const hasCachedQuota = this.accountManager.getCachedQuota(active.id) !== null;
 
-                // If a switch is pending and userStatus still has the old email,
-                // Anti-Gravity hasn't synced the new subscription yet.
-                // Mark everything inactive and show "switching" state.
-                if (this.switchPending && active.id === this.preTransitionUserId) {
-                    for (const acc of accounts) { acc.isActive = false; }
-                    this.startSyncRetryWindow();
-                    await this.context.globalState.update('orbitHub.accounts', accounts);
+                // Fetch quota before promoting a brand-new active account so a
+                // transient/stale auth identity does not show up as a blank or
+                // incorrect auth-only row.
+                const result = await this.quotaFetcher.fetchQuota(active);
+                const shouldHoldAuthOnlyAccount = active.source === 'authStatus'
+                    && !existingAccount
+                    && !hasCachedQuota;
+
+                if (shouldHoldAuthOnlyAccount || (!existingAccount && !hasCachedQuota && result.models.length === 0)) {
+                    if (shouldHoldAuthOnlyAccount || result.syncPending) {
+                        this.startSyncRetryWindow();
+                    }
                     this.sendState();
                     return;
                 }
@@ -82,6 +79,7 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                         acc.label = active.label;
                         acc.authEmail = active.authEmail;
                         acc.statePath = active.statePath;
+                        acc.source = active.source;
                         found = true;
                     } else {
                         acc.isActive = false;
@@ -94,14 +92,12 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                         authEmail: active.authEmail,
                         statePath: active.statePath,
                         isActive: true,
+                        source: active.source,
                     });
                 }
 
                 // Persist the updated account list
                 await this.context.globalState.update('orbitHub.accounts', accounts);
-
-                // Fetch quota for the active account
-                const result = await this.quotaFetcher.fetchQuota(active);
 
                 // Store sync error if any (for UI display)
                 const accIdx = accounts.findIndex(a => a.id === active.id);
@@ -116,22 +112,16 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                         models: result.models,
                         fetchedAt: Date.now(),
                     });
-                    this.switchPending = false;
-                    this.preTransitionUserId = null;
                     this.stopSyncRetryWindow();
                 } else if (result.syncPending) {
                     this.startSyncRetryWindow();
                 } else {
-                    this.switchPending = false;
-                    this.preTransitionUserId = null;
                     this.stopSyncRetryWindow();
                 }
             } else {
                 // System might be offline or app closed
                 for (const acc of accounts) { acc.isActive = false; }
                 await this.context.globalState.update('orbitHub.accounts', accounts);
-                this.switchPending = false;
-                this.preTransitionUserId = null;
                 this.stopSyncRetryWindow();
             }
         } catch (err) {
@@ -146,8 +136,22 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
 
         const accounts = this.accountManager.getAccounts();
         const allCached = this.accountManager.getAllCachedQuotas();
+        const authAliasIds = new Set(
+            accounts
+                .filter(acc =>
+                    acc.isActive
+                    && acc.source === 'unifiedStateSync'
+                    && acc.authEmail
+                    && acc.authEmail !== acc.id
+                )
+                .map(acc => acc.authEmail as string)
+        );
         const visibleAccounts = accounts
-            .filter(acc => acc.isActive || allCached[acc.id])
+            .filter(acc => {
+                const isAuthAliasOnly = authAliasIds.has(acc.id) && acc.source !== 'unifiedStateSync';
+                if (isAuthAliasOnly) { return false; }
+                return acc.isActive || allCached[acc.id];
+            })
             .sort((a, b) => {
                 if (a.isActive !== b.isActive) { return a.isActive ? -1 : 1; }
                 const aFetchedAt = allCached[a.id]?.fetchedAt ?? 0;

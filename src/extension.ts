@@ -53,7 +53,7 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.authentication.onDidChangeSessions(e => {
             if (e.provider.id === 'antigravity_auth' || e.provider.id === 'antigravity' || e.provider.id === 'google') {
-                void provider.refresh();
+                provider.handleAuthSessionChange();
             }
         })
     );

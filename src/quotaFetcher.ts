@@ -1,7 +1,7 @@
-import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as vscode from 'vscode';
 
 export interface ModelInfo { id: string; name: string; }
 
@@ -28,6 +28,7 @@ export interface ActiveAccountInfo {
     label: string;
     authEmail: string;  // authStatus email — Google OAuth (may differ), changes instantly on switch
     statePath: string;
+    source: 'unifiedStateSync' | 'authStatus';
 }
 
 export interface RawModelQuota {
@@ -56,6 +57,11 @@ interface UserStatusCandidate {
     source: 'unifiedStateSync' | 'authStatus';
     email: string | null;
     buf: Buffer;
+}
+
+interface LiveSessionInfo {
+    id: string;
+    label: string;
 }
 
 // ── Protobuf decoder ──────────────────────────────────────────────────────────
@@ -112,33 +118,6 @@ function getBufStr(f: ProtoFields, field: number): string | null {
 
 export class QuotaFetcher {
 
-    // ── Switch-acceleration state ─────────────────────────────────────────────
-    //
-    // authEmail (from the live session or antigravityAuthStatus) updates the
-    // instant the user switches accounts. The quota-owning userStatus blobs on
-    // disk can lag behind that switch, so Orbit Hub needs to detect the auth
-    // change immediately and keep retrying until one of the stored userStatus
-    // snapshots matches the new account.
-    //
-    // orbitHubProvider resolves its switchPending state only when active.id
-    // changes from the old value to a new one.  Without intervention, active.id
-    // (= userEmail) never changes during a live session, so the "switching…"
-    // overlay is shown forever.
-    //
-    // The acceleration logic makes active.id flip one poll after the authEmail
-    // change is first detected:
-    //
-    //   Poll where authEmail FIRST changes:
-    //     → return id = old userEmail   so orbitHubProvider records it as
-    //                                   preTransitionUserId
-    //
-    //   All subsequent polls while authEmail ≠ userEmail:
-    //     → return id = new authEmail   active.id ≠ preTransitionUserId
-    //                                   → orbitHubProvider resolves the switch
-    //
-    private _lastSeenAuthEmail: string | null = null;
-    private _pendingNewAuthEmail: string | null = null;
-
     /**
      * Detect the currently active account by reading antigravityAuthStatus
      * (updates immediately on login) and cross-referencing with userStatus.
@@ -148,80 +127,47 @@ export class QuotaFetcher {
         if (!fs.existsSync(statePath)) { return null; }
 
         try {
+            const liveUserStatus = await this.getLiveUserStatusCandidate();
+            const liveSession = await this.getLiveSessionAccount();
             const SQL = await this.loadSql();
             const mergedBuf = this.readAndMerge(statePath);
             const db = new SQL.Database(mergedBuf);
             let authEmail = 'unknown';
-            let userEmail = 'unknown';
+            let dbCandidate: UserStatusCandidate | null = null;
 
             try {
-                const liveAuthEmail = await this.detectLiveAuthEmail();
-                if (liveAuthEmail) {
-                    authEmail = liveAuthEmail;
-                }
-
                 const authStatus = this.extractAuthStatus(db);
+                const userStatusCandidates = this.extractUserStatusCandidates(db, authStatus);
 
                 // Step 1: Read authStatus email — updates INSTANTLY on switch.
-                if (authEmail === 'unknown') {
-                    const dbAuthEmail = this.extractEmailCandidate(authStatus?.email);
-                    if (dbAuthEmail) { authEmail = dbAuthEmail; }
-                }
+                const dbAuthEmail = this.extractEmailCandidate(authStatus?.email);
+                if (dbAuthEmail) { authEmail = dbAuthEmail; }
 
-                // Step 2: Read the freshest userStatus email we have on disk.
-                const userStatusEmail = this.resolveUserStatusEmail(
-                    this.extractUserStatusCandidates(db, authStatus),
-                    authEmail,
+                // Step 2: Prefer the unified userStatus snapshot for the visible
+                // account since Anti-Gravity refreshes that from profile + quota
+                // APIs after login. Fall back to authStatus only if unified is
+                // unavailable.
+                dbCandidate = this.resolveActiveUserStatusCandidate(
+                    userStatusCandidates,
                 );
-                if (userStatusEmail && userStatusEmail !== 'unknown') {
-                    userEmail = userStatusEmail;
-                }
             } finally {
                 db.close();
             }
 
-            // ── Switch-acceleration ───────────────────────────────────────────
-            const authJustChanged = this._lastSeenAuthEmail !== null
-                && authEmail !== 'unknown'
-                && authEmail !== this._lastSeenAuthEmail;
-
-            if (authJustChanged) {
-                this._pendingNewAuthEmail = authEmail;
-            }
-            if (authEmail !== 'unknown') {
-                this._lastSeenAuthEmail = authEmail;
-            }
-
-            let id: string | null;
-            if (
-                !authJustChanged                                 // not the first-change poll
-                && this._pendingNewAuthEmail !== null
-                && authEmail === this._pendingNewAuthEmail       // new authEmail is stable
-                && userEmail !== 'unknown'
-                && userEmail !== authEmail                       // userStatus still stale
-            ) {
-                // Return new authEmail so orbitHubProvider sees the id flip.
-                id = authEmail;
-            } else {
-                // Normal path, or the exact poll where authEmail just changed.
-                // Return old userEmail so preTransitionUserId gets the old value.
-                id = userEmail !== 'unknown' ? userEmail
-                    : authEmail !== 'unknown' ? authEmail
-                        : null;
-                // Clear once userStatus catches up
-                if (this._pendingNewAuthEmail !== null
-                    && (userEmail === authEmail || authEmail === 'unknown')) {
-                    this._pendingNewAuthEmail = null;
-                }
-            }
-
+            const liveId = liveSession?.id ?? liveUserStatus?.email ?? null;
+            const matchedCandidate = liveId
+                ? [liveUserStatus, dbCandidate].find(candidate => candidate?.email === liveId) ?? null
+                : liveUserStatus ?? dbCandidate;
+            const id = liveId ?? matchedCandidate?.email ?? (authEmail !== 'unknown' ? authEmail : null);
             if (!id) { return null; }
+            const source = matchedCandidate?.source ?? 'unifiedStateSync';
 
             return {
                 id,
-                label: id,
+                label: liveSession?.label ?? id,
                 authEmail: authEmail !== 'unknown' ? authEmail : id,
                 statePath,
+                source,
             };
         } catch {
             return null;
@@ -231,16 +177,26 @@ export class QuotaFetcher {
     /**
      * Fetch quota for the active account. Returns empty models when the stored
      * userStatus snapshots still belong to another account, rather than showing
-     * the wrong quota under the newly active email.
+     * the wrong quota under the newly active email. While Anti-Gravity is
+     * syncing, prefer matching the freshest auth email first and fall back to
+     * the last resolved account id.
      */
     async fetchQuota(account: ActiveAccountInfo): Promise<FetchResult> {
         try {
+            const liveUserStatus = await this.getLiveUserStatusCandidate();
+            if (liveUserStatus?.email === account.id) {
+                return {
+                    account,
+                    models: this.parseUserStatus(liveUserStatus.buf),
+                };
+            }
+
             const SQL = await this.loadSql();
             const mergedBuf = this.readAndMerge(account.statePath);
             const db = new SQL.Database(mergedBuf);
 
             try {
-                const userStatus = this.extractMatchingUserStatus(db, account.id);
+                const userStatus = this.extractMatchingUserStatus(db, account);
                 if (!userStatus) {
                     return {
                         account,
@@ -308,76 +264,6 @@ export class QuotaFetcher {
         return initSqlJs({ wasmBinary: wasmBinary.buffer as ArrayBuffer });
     }
 
-    private async detectLiveAuthEmail(): Promise<string | null> {
-        const providers = ['antigravity_auth', 'antigravity', 'google'];
-
-        for (const provider of providers) {
-            const sessionEmail = await this.detectAuthEmailFromSessions(provider);
-            if (sessionEmail) { return sessionEmail; }
-        }
-
-        for (const provider of providers) {
-            const accountEmail = await this.detectAuthEmailFromAccounts(provider);
-            if (accountEmail) { return accountEmail; }
-        }
-
-        return null;
-    }
-
-    private async detectAuthEmailFromAccounts(provider: string): Promise<string | null> {
-        try {
-            const accounts = await vscode.authentication.getAccounts(provider);
-            const uniqueEmails = new Set<string>();
-            for (const account of accounts) {
-                const email = this.extractEmailCandidate(account.label) ?? this.extractEmailCandidate(account.id);
-                if (email) { uniqueEmails.add(email); }
-            }
-
-            if (uniqueEmails.size === 1) {
-                return Array.from(uniqueEmails)[0];
-            }
-        } catch {
-            // Provider may not exist in this Anti-Gravity build.
-        }
-
-        return null;
-    }
-
-    private async detectAuthEmailFromSessions(provider: string): Promise<string | null> {
-        const scopeVariants: ReadonlyArray<ReadonlyArray<string>> = [
-            [],
-            ['email'],
-        ];
-
-        for (const scopes of scopeVariants) {
-            try {
-                const session = await vscode.authentication.getSession(provider, scopes, { silent: true });
-                const email = this.extractEmailFromSession(session);
-                if (email) { return email; }
-            } catch {
-                // Some providers/scopes may not exist in every Anti-Gravity build.
-            }
-        }
-
-        return null;
-    }
-
-    private extractEmailFromSession(session: vscode.AuthenticationSession | undefined): string | null {
-        if (!session) { return null; }
-
-        const candidates = [session.account.label, session.account.id];
-        for (const scope of session.scopes) {
-            candidates.push(scope);
-        }
-
-        for (const candidate of candidates) {
-            const email = this.extractEmailCandidate(candidate);
-            if (email) { return email; }
-        }
-
-        return null;
-    }
-
     private extractEmailCandidate(candidate: string | undefined): string | null {
         if (!candidate) { return null; }
 
@@ -396,6 +282,49 @@ export class QuotaFetcher {
         }
 
         return null;
+    }
+
+    private async getLiveSessionAccount(): Promise<LiveSessionInfo | null> {
+        for (const providerId of ['antigravity_auth', 'antigravity']) {
+            try {
+                const session = await vscode.authentication.getSession(providerId, [], { silent: true });
+                const id = this.extractEmailCandidate(session?.account.id)
+                    ?? this.extractEmailCandidate(session?.account.label);
+                if (!id) { continue; }
+
+                return {
+                    id,
+                    label: id,
+                };
+            } catch {
+                // Fall through to the next provider or disk-based detection.
+            }
+        }
+
+        return null;
+    }
+
+    private async getLiveUserStatusCandidate(): Promise<UserStatusCandidate | null> {
+        try {
+            const api = (vscode as typeof vscode & {
+                antigravityUnifiedStateSync?: {
+                    UserStatus?: {
+                        getUserStatus?: () => Promise<string | undefined>;
+                    };
+                };
+            }).antigravityUnifiedStateSync;
+            const raw = await api?.UserStatus?.getUserStatus?.();
+            if (!raw) { return null; }
+
+            const buf = Buffer.from(raw, 'base64');
+            return {
+                source: 'unifiedStateSync',
+                email: this.extractEmailFromUserStatusBuf(buf),
+                buf,
+            };
+        } catch {
+            return null;
+        }
     }
 
     private extractAuthStatus(db: import('sql.js').Database): AuthStatusSnapshot | null {
@@ -449,25 +378,35 @@ export class QuotaFetcher {
 
     private extractMatchingUserStatus(
         db: import('sql.js').Database,
-        accountId: string,
+        account: Pick<ActiveAccountInfo, 'id' | 'authEmail' | 'source'>,
     ): UserStatusCandidate | null {
         const candidates = this.extractUserStatusCandidates(db);
-        return candidates.find(candidate => candidate.email === accountId) ?? null;
-    }
-
-    private resolveUserStatusEmail(
-        candidates: UserStatusCandidate[],
-        authEmail: string,
-    ): string | null {
-        if (authEmail !== 'unknown') {
-            const authMatched = candidates.find(candidate => candidate.email === authEmail);
-            if (authMatched?.email) { return authMatched.email; }
+        const exactSourceMatch = candidates.find(candidate =>
+            candidate.source === account.source && candidate.email === account.id
+        );
+        if (exactSourceMatch) {
+            return exactSourceMatch;
         }
 
-        const unified = candidates.find(candidate => candidate.source === 'unifiedStateSync' && candidate.email);
-        if (unified?.email) { return unified.email; }
+        const exactIdMatch = candidates.find(candidate => candidate.email === account.id);
+        if (exactIdMatch) {
+            return exactIdMatch;
+        }
 
-        return candidates.find(candidate => candidate.email)?.email ?? null;
+        if (account.id === account.authEmail) {
+            return candidates.find(candidate => candidate.email === account.authEmail) ?? null;
+        }
+
+        return null;
+    }
+
+    private resolveActiveUserStatusCandidate(
+        candidates: UserStatusCandidate[],
+    ): UserStatusCandidate | null {
+        const unified = candidates.find(candidate => candidate.source === 'unifiedStateSync' && candidate.email);
+        if (unified) { return unified; }
+
+        return candidates.find(candidate => candidate.email) ?? null;
     }
 
     private extractAuthStatusUserStatusBuf(authStatus: AuthStatusSnapshot | null): Buffer | null {

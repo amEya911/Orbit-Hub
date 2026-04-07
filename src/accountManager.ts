@@ -6,6 +6,7 @@ export interface Account {
     authEmail?: string;     // Google OAuth email from authStatus (for switch detection)
     statePath: string;
     isActive: boolean;
+    source?: 'unifiedStateSync' | 'authStatus';
     syncError?: string;
 }
 
