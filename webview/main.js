@@ -223,6 +223,7 @@ function buildModelRow(m, isAccountActive) {
     let statusCls = 'filled';
     if (m.state === 'exhausted') statusCls = 'exhausted';
     else if (m.state === 'low') statusCls = 'low';
+    else if (segmentsFilled === 2) statusCls = 'medium';
     else if (m.state === 'available') statusCls = 'available';
 
     const isStale = m.isStale ?? false;

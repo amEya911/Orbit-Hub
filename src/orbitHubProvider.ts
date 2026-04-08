@@ -69,7 +69,7 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 }
 
                 await this.context.globalState.update('orbitHub.accounts', reordered);
-                // No need to refresh full state, just notify views if any (though currently only one)
+                this.sendState(); // Instantly push the new order to the webview
             }
         });
     }

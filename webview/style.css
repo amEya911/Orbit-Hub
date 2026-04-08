@@ -154,19 +154,27 @@ body {
 }
 
 .sync-error {
-  font-size: 11px;
-  color: #fbbf24;
-  background: rgba(251, 191, 36, 0.1);
-  padding: 2px 6px;
-  border-radius: 4px;
-  margin-right: 8px;
-  animation: pulse 2s infinite;
+    font-size: 11px;
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-right: 8px;
+    animation: pulse 2s infinite;
 }
 
 @keyframes pulse {
-  0% { opacity: 0.7; }
-  50% { opacity: 1; }
-  100% { opacity: 0.7; }
+    0% {
+        opacity: 0.7;
+    }
+
+    50% {
+        opacity: 1;
+    }
+
+    100% {
+        opacity: 0.7;
+    }
 }
 
 .fetched-time {
@@ -325,11 +333,18 @@ body {
 }
 
 .segment.filled {
-    background: #d4a017; /* Bright yellow */
+    background: #ffffff;
+    /* White */
+}
+
+.segment.medium {
+    background: #d4a017;
+    /* Bright yellow */
 }
 
 .segment.low {
-    background: #e06c1a; /* Orange */
+    background: #e06c1a;
+    /* Orange */
 }
 
 .segment.exhausted {
@@ -337,7 +352,8 @@ body {
 }
 
 .segment.available {
-    background: #4ec94e; /* Green */
+    background: #4ec94e;
+    /* Green */
 }
 
 .model-name-wrapper {
