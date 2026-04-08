@@ -122,7 +122,16 @@ export class QuotaFetcher {
         if (!fs.existsSync(statePath)) { return null; }
 
         try {
+            const liveApiAvailable = this.isLiveApiAvailable();
             const liveUserStatus = await this.getLiveUserStatusCandidate();
+
+            // ── Guard: detect logout via the live API ────────────────────────
+            // After logout the SQLite database retains stale auth/user status
+            // rows.  If the live antigravityUnifiedStateSync API exists (we're
+            // running inside Anti-Gravity) but returned nothing, the user is
+            // conclusively signed out.  Only fall back to the DB when the API
+            // is entirely unavailable (e.g. standard VS Code / older builds).
+            if (liveApiAvailable && !liveUserStatus) { return null; }
             const SQL = await this.loadSql();
             const mergedBuf = this.readAndMerge(statePath);
             const db = new SQL.Database(mergedBuf);
@@ -209,6 +218,24 @@ export class QuotaFetcher {
                 error: err instanceof Error ? err.message : String(err),
             };
         }
+    }
+
+    // ── Live API availability ──────────────────────────────────────────────
+
+    /**
+     * Returns true when the antigravityUnifiedStateSync proposed API exists.
+     * This tells us we're running inside Anti-Gravity (not vanilla VS Code)
+     * and can trust the API's absence-of-data to mean "logged out".
+     */
+    private isLiveApiAvailable(): boolean {
+        const api = (vscode as typeof vscode & {
+            antigravityUnifiedStateSync?: {
+                UserStatus?: {
+                    getUserStatus?: () => Promise<string | undefined>;
+                };
+            };
+        }).antigravityUnifiedStateSync;
+        return !!(api?.UserStatus?.getUserStatus);
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

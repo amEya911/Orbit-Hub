@@ -131,7 +131,9 @@ function render() {
     if (!state.accounts.length) {
         app.innerHTML = buildNoData() + buildGlobalFooter();
     } else {
-        app.innerHTML = state.accounts.map(buildAccount).join('') + buildGlobalFooter();
+        const anyActive = state.accounts.some(a => a.account.isActive);
+        const signedOutBanner = !anyActive ? buildSignedOutBanner() : '';
+        app.innerHTML = signedOutBanner + state.accounts.map(buildAccount).join('') + buildGlobalFooter();
     }
 }
 
@@ -146,6 +148,14 @@ function buildNoData() {
       <div class="empty-icon">🛸</div>
       <div class="empty-title">Detecting account…</div>
       <div class="empty-sub">Make sure Anti-Gravity is running and you are logged in.</div>
+    </div>`;
+}
+
+function buildSignedOutBanner() {
+    return `<div class="signed-out-banner">
+      <span class="signed-out-icon">⚡</span>
+      <span class="signed-out-text">No account signed in</span>
+      <span class="signed-out-sub">Sign in to Anti-Gravity to see live quota</span>
     </div>`;
 }
 

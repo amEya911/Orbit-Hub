@@ -39,6 +39,36 @@ body {
     line-height: 1.5;
 }
 
+/* ── Signed-out banner ──────────────────────────────────────────────────── */
+.signed-out-banner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 14px 16px;
+    margin: 8px 10px 4px;
+    border-radius: 6px;
+    background: rgba(251, 191, 36, 0.08);
+    border: 1px solid rgba(251, 191, 36, 0.2);
+    text-align: center;
+}
+
+.signed-out-icon {
+    font-size: 18px;
+}
+
+.signed-out-text {
+    font-size: 12px;
+    font-weight: 600;
+    color: #fbbf24;
+}
+
+.signed-out-sub {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+}
+
 /* ── Account section ─────────────────────────────────────────────────────── */
 .account-section {
     padding: 12px 14px 16px;
