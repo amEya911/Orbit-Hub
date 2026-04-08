@@ -20,7 +20,13 @@ function run(command, args) {
 }
 
 function findEditorCli() {
-  const candidates = ["code", "cursor", "windsurf", "codium"];
+  const candidates = [
+    "code",
+    "cursor",
+    "windsurf",
+    "codium",
+    "/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity",
+  ];
 
   for (const candidate of candidates) {
     const result = spawnSync(candidate, ["--version"], {

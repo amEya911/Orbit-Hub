@@ -59,11 +59,6 @@ interface UserStatusCandidate {
     buf: Buffer;
 }
 
-interface LiveSessionInfo {
-    id: string;
-    label: string;
-}
-
 // ── Protobuf decoder ──────────────────────────────────────────────────────────
 
 type ProtoVal = number | Buffer;
@@ -128,7 +123,6 @@ export class QuotaFetcher {
 
         try {
             const liveUserStatus = await this.getLiveUserStatusCandidate();
-            const liveSession = await this.getLiveSessionAccount();
             const SQL = await this.loadSql();
             const mergedBuf = this.readAndMerge(statePath);
             const db = new SQL.Database(mergedBuf);
@@ -154,17 +148,14 @@ export class QuotaFetcher {
                 db.close();
             }
 
-            const liveId = liveSession?.id ?? liveUserStatus?.email ?? null;
-            const matchedCandidate = liveId
-                ? [liveUserStatus, dbCandidate].find(candidate => candidate?.email === liveId) ?? null
-                : liveUserStatus ?? dbCandidate;
-            const id = liveId ?? matchedCandidate?.email ?? (authEmail !== 'unknown' ? authEmail : null);
+            const matchedCandidate = liveUserStatus ?? dbCandidate;
+            const id = matchedCandidate?.email ?? (authEmail !== 'unknown' ? authEmail : null);
             if (!id) { return null; }
-            const source = matchedCandidate?.source ?? 'unifiedStateSync';
+            const source = matchedCandidate?.source ?? 'authStatus';
 
             return {
                 id,
-                label: liveSession?.label ?? id,
+                label: id,
                 authEmail: authEmail !== 'unknown' ? authEmail : id,
                 statePath,
                 source,
@@ -293,26 +284,6 @@ export class QuotaFetcher {
             }
         } catch {
             // Not JSON; plain string candidates are handled above.
-        }
-
-        return null;
-    }
-
-    private async getLiveSessionAccount(): Promise<LiveSessionInfo | null> {
-        for (const providerId of ['antigravity_auth', 'antigravity']) {
-            try {
-                const session = await vscode.authentication.getSession(providerId, [], { silent: true });
-                const id = this.extractEmailCandidate(session?.account.id)
-                    ?? this.extractEmailCandidate(session?.account.label);
-                if (!id) { continue; }
-
-                return {
-                    id,
-                    label: id,
-                };
-            } catch {
-                // Fall through to the next provider or disk-based detection.
-            }
         }
 
         return null;

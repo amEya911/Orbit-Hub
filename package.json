@@ -17,6 +17,9 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "enabledApiProposals": [
+    "antigravityUnifiedStateSync"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
