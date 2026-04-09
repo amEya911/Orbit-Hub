@@ -284,7 +284,7 @@ export class QuotaFetcher {
             const initSqlJs = require('sql.js') as typeof import('sql.js');
             const sqlJsPath = require.resolve('sql.js');
             const wasmPath = path.join(path.dirname(sqlJsPath), 'sql-wasm.wasm');
-            
+
             if (!this.wasmBinary) {
                 const buf = fs.readFileSync(wasmPath);
                 this.wasmBinary = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
@@ -646,13 +646,40 @@ export class QuotaFetcher {
 
     static defaultStatePath(): string {
         const home = os.homedir();
+        const suffix = path.join('User', 'globalStorage', 'state.vscdb');
+
+        let bases: string[];
         switch (process.platform) {
-            case 'win32':
-                return path.join(process.env['APPDATA'] ?? home, 'Anti-Gravity', 'User', 'globalStorage', 'state.vscdb');
-            case 'darwin':
-                return path.join(home, 'Library', 'Application Support', 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
-            default:
-                return path.join(home, '.config', 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
+            case 'win32': {
+                const appData = process.env['APPDATA'] ?? home;
+                bases = [
+                    path.join(appData, 'Antigravity', suffix),
+                    path.join(appData, 'Anti-Gravity', suffix),
+                ];
+                break;
+            }
+            case 'darwin': {
+                const support = path.join(home, 'Library', 'Application Support');
+                bases = [
+                    path.join(support, 'Antigravity', suffix),
+                    path.join(support, 'Anti-Gravity', suffix),
+                ];
+                break;
+            }
+            default: {
+                const config = path.join(home, '.config');
+                bases = [
+                    path.join(config, 'Antigravity', suffix),
+                    path.join(config, 'Anti-Gravity', suffix),
+                ];
+                break;
+            }
         }
+
+        // Return the first path that exists on disk, falling back to the primary candidate.
+        for (const candidate of bases) {
+            if (fs.existsSync(candidate)) { return candidate; }
+        }
+        return bases[0];
     }
 }

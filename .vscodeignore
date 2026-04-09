@@ -1,0 +1,24 @@
+# ── Source & config (not needed at runtime) ──────────────────────────────
+src/**
+.git/**
+.gitignore
+.vscode/**
+scripts/**
+tsconfig.json
+.DS_Store
+*.vsix
+
+# ── Build artifacts we don't ship ────────────────────────────────────────
+out/**/*.js.map
+webview/jsconfig.json
+
+# ── README assets (PNG is only for GitHub display) ───────────────────────
+resources/orbit-icon.png
+
+# ── node_modules: exclude everything, then whitelist what we need ────────
+node_modules/**
+
+# ── Whitelist: sql.js runtime files only ─────────────────────────────────
+!node_modules/sql.js/dist/sql-wasm.js
+!node_modules/sql.js/dist/sql-wasm.wasm
+!node_modules/sql.js/package.json
