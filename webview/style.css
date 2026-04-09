@@ -39,6 +39,38 @@ body {
     line-height: 1.5;
 }
 
+/* ── Detecting account ellipsis animation ────────────────────────────────── */
+.detecting-anim::after {
+    content: '';
+    animation: ellipsis 1.5s steps(3, end) infinite;
+}
+
+@keyframes ellipsis {
+    0%   { content: ''; }
+    33%  { content: '.'; }
+    66%  { content: '..'; }
+    100% { content: '...'; }
+}
+
+/* ── Inline SVG icons ───────────────────────────────────────────────────── */
+.icon-orbit {
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+}
+
+.icon-bolt {
+    color: #fbbf24;
+}
+
+.icon-sync {
+    vertical-align: middle;
+    margin-right: 3px;
+}
+
+.icon-close {
+    vertical-align: middle;
+}
+
 /* ── Signed-out banner ──────────────────────────────────────────────────── */
 .signed-out-banner {
     display: flex;
@@ -76,7 +108,7 @@ body {
 
 .account-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     margin-bottom: 5px;
     cursor: grab;
@@ -93,10 +125,23 @@ body {
     background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.1));
 }
 
-.account-info {
+.account-info-container {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.account-info-top {
     display: flex;
     align-items: center;
     gap: 7px;
+}
+
+.fetched-time-row {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+    padding-left: 34px;
 }
 
 .account-dot {

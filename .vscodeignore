@@ -12,8 +12,6 @@ tsconfig.json
 out/**/*.js.map
 webview/jsconfig.json
 
-# ── README assets (PNG is only for GitHub display) ───────────────────────
-resources/orbit-icon.png
 
 # ── node_modules: exclude everything, then whitelist what we need ────────
 node_modules/**

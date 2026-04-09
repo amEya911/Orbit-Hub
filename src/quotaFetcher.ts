@@ -65,14 +65,14 @@ type ProtoVal = number | Buffer;
 type ProtoFields = Record<number, ProtoVal[]>;
 
 function readVarint(b: Buffer, i: number): { val: number; i: number } {
-    let val = 0, shift = 0, byte = 0;
+    let val = BigInt(0), shift = BigInt(0), byte = 0;
     do {
         if (i >= b.length) break;
         byte = b[i++];
-        if (shift < 28) { val |= (byte & 0x7f) << shift; }
-        shift += 7;
+        val |= BigInt(byte & 0x7f) << shift;
+        shift += BigInt(7);
     } while (byte & 0x80);
-    return { val, i };
+    return { val: Number(val), i };
 }
 
 function decode(b: Buffer): ProtoFields {
