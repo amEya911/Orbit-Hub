@@ -172,7 +172,7 @@ function buildAccount(entry) {
         : '';
 
     return `
-    <div class="account-section ${isCollapsed ? 'collapsed' : ''}" id="acc-${account.id}" draggable="true">
+    <div class="account-section ${isCollapsed ? 'collapsed' : ''}" id="acc-${esc(account.id)}" draggable="true">
       <div class="account-header">
         <div class="account-info">
           <span class="chevron">▼</span>

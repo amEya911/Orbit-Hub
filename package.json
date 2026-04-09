@@ -8,6 +8,7 @@
     "url": "https://github.com/amEya911/Orbit-Hub"
   },
   "version": "0.1.0",
+  "icon": "resources/orbit-icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },

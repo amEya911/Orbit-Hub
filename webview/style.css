@@ -263,10 +263,6 @@ body {
     flex: 1;
 }
 
-.warn-icon {
-    font-size: 12px;
-    margin-left: 4px;
-}
 
 .model-reset {
     font-size: 11px;
@@ -398,15 +394,4 @@ body {
 .reset-link:hover {
     opacity: 1;
     text-decoration: underline;
-}
-
-.fetched-badge {
-    font-size: 9px;
-    color: var(--vscode-descriptionForeground);
-    opacity: 0.5;
-    background: rgba(128, 128, 128, 0.1);
-    padding: 1px 4px;
-    border-radius: 3px;
-    white-space: nowrap;
-    margin-left: 2px;
 }

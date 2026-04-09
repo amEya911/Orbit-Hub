@@ -66,7 +66,12 @@ type ProtoFields = Record<number, ProtoVal[]>;
 
 function readVarint(b: Buffer, i: number): { val: number; i: number } {
     let val = 0, shift = 0, byte = 0;
-    do { byte = b[i++]; val |= (byte & 0x7f) << shift; shift += 7; } while (byte & 0x80);
+    do {
+        if (i >= b.length) break;
+        byte = b[i++];
+        if (shift < 28) { val |= (byte & 0x7f) << shift; }
+        shift += 7;
+    } while (byte & 0x80);
     return { val, i };
 }
 
@@ -89,7 +94,7 @@ function decode(b: Buffer): ProtoFields {
             } else if (wt === 5) { if (i + 4 > b.length) { break; } i += 4; }
             else if (wt === 1) { if (i + 8 > b.length) { break; } i += 8; }
             else { break; }
-        } catch { break; }
+        } catch (err) { console.debug('[OrbitHub] decode: field parse error', err); break; }
     }
     return fields;
 }
@@ -169,7 +174,8 @@ export class QuotaFetcher {
                 statePath,
                 source,
             };
-        } catch {
+        } catch (err) {
+            console.debug('[OrbitHub] detectActiveAccount failed:', err);
             return null;
         }
     }
@@ -334,7 +340,8 @@ export class QuotaFetcher {
                 email: this.extractEmailFromUserStatusBuf(buf),
                 buf,
             };
-        } catch {
+        } catch (err) {
+            console.debug('[OrbitHub] getLiveUserStatusCandidate failed:', err);
             return null;
         }
     }
@@ -346,7 +353,8 @@ export class QuotaFetcher {
             );
             if (!authRes.length || !authRes[0].values.length) { return null; }
             return JSON.parse(String(authRes[0].values[0][0])) as AuthStatusSnapshot;
-        } catch {
+        } catch (err) {
+            console.debug('[OrbitHub] extractAuthStatus failed:', err);
             return null;
         }
     }
@@ -355,7 +363,8 @@ export class QuotaFetcher {
         try {
             const us = decode(buf);
             return this.extractEmailCandidate(getBufStr(us, 7) ?? getBufStr(us, 3) ?? undefined);
-        } catch {
+        } catch (err) {
+            console.debug('[OrbitHub] extractEmailFromUserStatusBuf failed:', err);
             return null;
         }
     }
@@ -426,7 +435,8 @@ export class QuotaFetcher {
             const raw = authStatus?.userStatusProtoBinaryBase64;
             if (!raw) { return null; }
             return Buffer.from(raw, 'base64');
-        } catch {
+        } catch (err) {
+            console.debug('[OrbitHub] extractAuthStatusUserStatusBuf failed:', err);
             return null;
         }
     }
@@ -456,7 +466,8 @@ export class QuotaFetcher {
             if (!b64buf) { return null; }
 
             return Buffer.from(b64buf.toString('utf8'), 'base64');
-        } catch {
+        } catch (err) {
+            console.debug('[OrbitHub] extractUnifiedUserStatusBuf failed:', err);
             return null;
         }
     }
@@ -639,7 +650,8 @@ export class QuotaFetcher {
                 }
             }
             return dbCopy;
-        } catch {
+        } catch (err) {
+            console.debug('[OrbitHub] mergeWal failed:', err);
             return dbBuf;
         }
     }
