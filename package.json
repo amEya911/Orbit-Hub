@@ -1,7 +1,7 @@
 {
-  "name": "orbit-hub",
-  "publisher": "ameyakulkarni",
-  "displayName": "Orbit Hub",
+  "name": "orbit-hub-manager",
+  "publisher": "AmeyaKulkarni",
+  "displayName": "Orbit Hub Manager",
   "description": "Multi-account quota dashboard for Anti-Gravity IDE",
   "repository": {
     "type": "git",
@@ -17,9 +17,6 @@
   ],
   "activationEvents": [
     "onStartupFinished"
-  ],
-  "enabledApiProposals": [
-    "antigravityUnifiedStateSync"
   ],
   "main": "./out/extension.js",
   "contributes": {

@@ -110,6 +110,29 @@ A pre-built `.vsix` file is attached to this repository's releases. To install i
 
 If you prefer to build from source, clone the repository, run `npm install` to fetch dependencies, and then run `npm run install:local`. This script compiles the TypeScript, packages the extension, and installs it into whichever editor CLI it finds on your system. After installation, run "Developer: Reload Window" from the Command Palette.
 
+## Quick Install
+
+> **Note:** Orbit Hub is built exclusively for the Anti-Gravity IDE. While the extension can be installed in VS Code or Cursor, it will not function there — it relies on Anti-Gravity's internal state database and APIs.
+
+One command to download and install the latest release:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/amEya911/Orbit-Hub/main/install.sh | bash
+```
+
+The script automatically detects your editor CLI (`antigravity`, `cursor`, or `code`), downloads the latest `.vsix` from GitHub Releases, and installs it.
+
+### Manual install
+
+If you prefer to install manually, download the `.vsix` from the [latest release](https://github.com/amEya911/Orbit-Hub/releases/latest) and run:
+
+```bash
+# Replace with the path to the downloaded file
+antigravity --install-extension orbit-hub-manager-*.vsix
+```
+
+You can substitute `antigravity` with `cursor` or `code` depending on your editor.
+
 ## Configuration
 
 Orbit Hub requires no manual configuration. It resolves the Anti-Gravity state database path automatically based on your operating system. On macOS, it looks in `~/Library/Application Support/Antigravity/User/globalStorage/state.vscdb`, with a fallback to the `Anti-Gravity` directory variant. On Windows, the equivalent path is `%APPDATA%\Antigravity\User\globalStorage\state.vscdb`. On Linux, it checks `~/.config/Antigravity/User/globalStorage/state.vscdb`. The extension tries both naming conventions on all platforms and uses whichever path exists on disk. If neither exists (because Anti-Gravity is not installed or has never been run), the sidebar displays a "Detecting account" state until the database becomes available.
