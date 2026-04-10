@@ -7,6 +7,48 @@
 
 Orbit Hub is a VS Code sidebar extension built exclusively for the Anti-Gravity IDE. It reads the IDE's internal SQLite state database, decodes quota information from raw protobuf payloads, and renders a real-time, multi-account dashboard showing remaining model credits for Gemini 3.1 Pro, Gemini 3 Flash, Claude Sonnet 4.6, Claude Opus 4.6, and GPT-OSS 120B. Every linked Google account appears in a single panel with segmented progress bars, live countdown timers to the next quota reset, and visual warnings when credits are running low or data is stale.
 
+## What is this?
+
+If you use Anti-Gravity with multiple accounts to extend AI usage limits, Orbit Hub gives you a **single dashboard to track all your quotas in real time**.
+
+No more:
+
+* switching accounts to check credits
+* guessing reset times
+* losing track of usage
+
+Everything is visible in one sidebar.
+
+
+## Installation
+
+A pre-built `.vsix` file is attached to this repository's releases. To install it, open your editor (Anti-Gravity, VS Code, Cursor, or any compatible fork), open the Command Palette, and run `Extensions: Install from VSIX...`. Select the downloaded `.vsix` file and reload the window when prompted. The extension will appear as a new icon in the activity bar on the left side of the editor.
+
+If you prefer to build from source, clone the repository, run `npm install` to fetch dependencies, and then run `npm run install:local`. This script compiles the TypeScript, packages the extension, and installs it into whichever editor CLI it finds on your system. After installation, run "Developer: Reload Window" from the Command Palette.
+
+## Quick Install
+
+> **Note:** Orbit Hub is built exclusively for the Anti-Gravity IDE. While the extension can be installed in VS Code or Cursor, it will not function there — it relies on Anti-Gravity's internal state database and APIs.
+
+One command to download and install the latest release:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/amEya911/Orbit-Hub/main/install.sh | bash
+```
+
+The script automatically detects your editor CLI (`antigravity`, `cursor`, or `code`), downloads the latest `.vsix` from GitHub Releases, and installs it.
+
+### Manual install
+
+If you prefer to install manually, download the `.vsix` from the [latest release](https://github.com/amEya911/Orbit-Hub/releases/latest) and run:
+
+```bash
+# Replace with the path to the downloaded file
+antigravity --install-extension orbit-hub-manager-*.vsix
+```
+
+You can substitute `antigravity` with `cursor` or `code` depending on your editor.
+
 ## How it works
 
 The core technical challenge Orbit Hub solves is that Anti-Gravity writes its usage data into a WAL-mode SQLite database, and the main database file is only flushed to disk when Anti-Gravity checkpoints (typically on shutdown). That means a naive `fs.readFileSync` on the `.vscdb` file returns stale data. Orbit Hub works around this by implementing a custom WAL merge engine that reads the write-ahead log from disk, replays committed frames into a memory buffer, and patches the SQLite header bytes from WAL mode to legacy journal mode before handing the buffer to the WASM-based sql.js engine. The quota payloads inside the database are stored as nested protobuf binaries without publicly available `.proto` schema files, so Orbit Hub includes a zero-dependency protobuf decoder that walks the wire format recursively to extract credit percentages, reset timestamps, and model display names.
@@ -104,34 +146,6 @@ Account cards in the sidebar can be reordered by dragging. Each card shows the a
 
 Hovering over any progress bar reveals a tooltip that tracks your mouse position horizontally across the bar, showing the exact remaining percentage. The tooltip follows the cursor in real time and disappears as soon as the mouse leaves the bar area. When quota data is more than an hour old for the active account, a stale data warning appears alongside the model name, along with the age of the data and a suggestion to open the Anti-Gravity app to trigger a sync.
 
-## Installation
-
-A pre-built `.vsix` file is attached to this repository's releases. To install it, open your editor (Anti-Gravity, VS Code, Cursor, or any compatible fork), open the Command Palette, and run `Extensions: Install from VSIX...`. Select the downloaded `.vsix` file and reload the window when prompted. The extension will appear as a new icon in the activity bar on the left side of the editor.
-
-If you prefer to build from source, clone the repository, run `npm install` to fetch dependencies, and then run `npm run install:local`. This script compiles the TypeScript, packages the extension, and installs it into whichever editor CLI it finds on your system. After installation, run "Developer: Reload Window" from the Command Palette.
-
-## Quick Install
-
-> **Note:** Orbit Hub is built exclusively for the Anti-Gravity IDE. While the extension can be installed in VS Code or Cursor, it will not function there — it relies on Anti-Gravity's internal state database and APIs.
-
-One command to download and install the latest release:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/amEya911/Orbit-Hub/main/install.sh | bash
-```
-
-The script automatically detects your editor CLI (`antigravity`, `cursor`, or `code`), downloads the latest `.vsix` from GitHub Releases, and installs it.
-
-### Manual install
-
-If you prefer to install manually, download the `.vsix` from the [latest release](https://github.com/amEya911/Orbit-Hub/releases/latest) and run:
-
-```bash
-# Replace with the path to the downloaded file
-antigravity --install-extension orbit-hub-manager-*.vsix
-```
-
-You can substitute `antigravity` with `cursor` or `code` depending on your editor.
 
 ## Configuration
 
