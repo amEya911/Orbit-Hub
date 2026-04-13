@@ -138,14 +138,12 @@ function render() {
 }
 
 function buildGlobalFooter() {
-    // copy: updated for tone/professionalism
     return `<div class="global-footer">
         <a href="#" class="reset-link">Reset all data</a>
     </div>`;
 }
 
 function buildNoData() {
-    // copy: updated for tone/professionalism
     return `<div class="empty-state">
       <div class="empty-icon"><svg class="icon-orbit" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.5"/><ellipse cx="12" cy="12" rx="10" ry="3.5" transform="rotate(-40 12 12)"/><ellipse cx="12" cy="12" rx="10" ry="3.5" transform="rotate(40 12 12)"/></svg></div>
       <div class="empty-title detecting-anim">Detecting account</div>
@@ -154,7 +152,6 @@ function buildNoData() {
 }
 
 function buildSignedOutBanner() {
-    // copy: updated for tone/professionalism
     return `<div class="signed-out-banner">
       <span class="signed-out-icon"><svg class="icon-bolt" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>
       <span class="signed-out-text">No account detected</span>
@@ -184,10 +181,8 @@ function buildAccount(entry) {
           ${fetchedStr ? `<div class="fetched-time-row">Updated ${fetchedStr}</div>` : ''}
         </div>
         <div class="account-meta">
-          <!-- copy: updated for tone/professionalism -->
           ${account.syncError ? `<span class="sync-error" title="${esc(account.syncError)}"><svg class="icon-sync" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Syncing</span>` : ''}
           ${refreshHtml}
-          <!-- copy: updated for tone/professionalism -->
           <button class="remove-btn" title="Remove account"><svg class="icon-close" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
         </div>
       </div>
@@ -235,7 +230,6 @@ function buildModelRow(m, isAccountActive) {
     const ageDays = m.dataAgeMs ? Math.floor(m.dataAgeMs / (24 * 60 * 60 * 1000)) : 0;
     const staleMsg = isStale ? (ageDays > 0 ? `Synced ${ageDays}d ago` : 'Synced recently') : '';
 
-    // copy: updated for tone/professionalism
     const warnIcon = (m.state === 'low' || m.state === 'exhausted' || isStale) ? `<span class="warn-icon" title="${isStale ? `Data is ${ageDays}d old. Open Anti-Gravity IDE and refresh to sync.` : ''}"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L1 21h22L12 2zm0 4l7.53 13H4.47L12 6zm-1 5v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg></span>` : '';
     const fetchedStr = m.fetchedAt ? formatFetchedTime(m.fetchedAt, isAccountActive) : '—';
 
@@ -277,7 +271,6 @@ function tickCountdowns() {
 }
 
 function fmtReset(ms, isActiveAccount = true, state = '', isStale = false, staleMsg = '') {
-    // copy: updated for tone/professionalism
     if (state === 'available') return '100% credits available';
 
     const prefix = isStale ? ` (${staleMsg})` : '';

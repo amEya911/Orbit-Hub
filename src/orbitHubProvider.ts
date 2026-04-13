@@ -48,7 +48,6 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     return;
                 }
 
-                // copy: updated for tone/professionalism
                 const choice = await vscode.window.showWarningMessage(
                     `Are you sure you want to remove account "${account.label}"? This will also clear its cached quota data.`,
                     { modal: true },
