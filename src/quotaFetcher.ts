@@ -5,23 +5,20 @@ import * as vscode from 'vscode';
 
 export interface ModelInfo { id: string; name: string; }
 
-const MODEL_NAME_MAP: Record<string, string> = {
-    'Gemini 3.1 Pro (High)': 'gemini-3.1-pro-high',
-    'Gemini 3.1 Pro (Low)': 'gemini-3.1-pro-low',
-    'Gemini 3 Flash': 'gemini-3-flash',
-    'Claude Sonnet 4.6 (Thinking)': 'claude-sonnet-4-6',
-    'Claude Opus 4.6 (Thinking)': 'claude-opus-4-6',
-    'GPT-OSS 120B (Medium)': 'gpt-oss-120b',
-};
-
-export const MODELS: ModelInfo[] = [
-    { id: 'gemini-3.1-pro-high', name: 'Gemini 3.1 Pro High' },
-    { id: 'gemini-3.1-pro-low', name: 'Gemini 3.1 Pro Low' },
-    { id: 'gemini-3-flash', name: 'Gemini 3 Flash' },
-    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-    { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
-    { id: 'gpt-oss-120b', name: 'GPT-OSS 120B (Medium)' },
-];
+/**
+ * Derive a stable model ID from the display name found in the protobuf.
+ * Lowercase, strip parenthesised qualifiers, collapse whitespace → hyphens.
+ * e.g. "Gemini 3.1 Pro (High)" → "gemini-3.1-pro-high"
+ *      "Claude Opus 4.6 (Thinking)" → "claude-opus-4.6-thinking"
+ */
+function deriveModelId(displayName: string): string {
+    return displayName
+        .replace(/\(([^)]+)\)/g, ' $1')   // unwrap parenthesised text
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9.]+/g, '-')      // non-alnum → hyphen
+        .replace(/^-+|-+$/g, '');           // trim leading/trailing hyphens
+}
 
 export interface ActiveAccountInfo {
     id: string;         // userStatus email — the quota/subscription owner
@@ -44,6 +41,7 @@ export interface RawModelQuota {
 export interface FetchResult {
     account: ActiveAccountInfo;
     models: RawModelQuota[];
+    isPro?: boolean;
     error?: string;
     syncPending?: boolean;
 }
@@ -187,13 +185,33 @@ export class QuotaFetcher {
      * syncing, prefer matching the freshest auth email first and fall back to
      * the last resolved account id.
      */
+    private checkIsPro(buf: Buffer): boolean {
+        try {
+            const us = decode(buf);
+            const f36buf = getBuf(us, 36);
+            if (!f36buf) { return false; }
+            const f36 = decode(f36buf);
+            const tierVal = f36[1]?.[0];
+            const tier = Buffer.isBuffer(tierVal) ? tierVal.toString('utf8') : '';
+            return !!(tier && tier.toLowerCase().includes('pro'));
+        } catch {
+            return false;
+        }
+    }
+
     async fetchQuota(account: ActiveAccountInfo): Promise<FetchResult> {
         try {
             const liveUserStatus = await this.getLiveUserStatusCandidate();
             if (liveUserStatus?.email === account.id) {
+                const models = this.parseUserStatus(liveUserStatus.buf);
+                const isPro = this.checkIsPro(liveUserStatus.buf) || models.some(m => {
+                    const cycle = m.resetAt - Date.now();
+                    return cycle > 0 && cycle < 24 * 60 * 60 * 1000;
+                });
                 return {
                     account,
-                    models: this.parseUserStatus(liveUserStatus.buf),
+                    models,
+                    isPro,
                 };
             }
 
@@ -207,13 +225,18 @@ export class QuotaFetcher {
                     return {
                         account,
                         models: [],
+                        isPro: false,
                         error: 'userStatus syncing for new account',
                         syncPending: true,
                     };
                 }
 
                 const models = this.parseUserStatus(userStatus.buf);
-                return { account, models };
+                const isPro = this.checkIsPro(userStatus.buf) || models.some(m => {
+                    const cycle = m.resetAt - Date.now();
+                    return cycle > 0 && cycle < 24 * 60 * 60 * 1000;
+                });
+                return { account, models, isPro };
             } finally {
                 db.close();
             }
@@ -221,6 +244,7 @@ export class QuotaFetcher {
             return {
                 account,
                 models: [],
+                isPro: false,
                 error: err instanceof Error ? err.message : String(err),
             };
         }
@@ -492,11 +516,9 @@ export class QuotaFetcher {
             const displayName = nameBuf.toString('utf8');
             if (!displayName || displayName.includes('/')) { continue; }
 
-            const modelId = MODEL_NAME_MAP[displayName];
+            // Dynamically derive a stable ID from whatever name the proto provides.
+            const modelId = deriveModelId(displayName);
             if (!modelId) { continue; }
-
-            const modelInfo = MODELS.find(m => m.id === modelId);
-            if (!modelInfo) { continue; }
 
             const f2buf = getBuf(f, 2);
             const f2 = f2buf ? decode(f2buf) : {};
@@ -529,10 +551,18 @@ export class QuotaFetcher {
                             if (secs && secs > 0) {
                                 resetAt = secs * 1000;
                                 if (resetAt < now) {
-                                    const cycle = modelId === 'gemini-3-flash'
-                                        ? 5 * 60 * 60 * 1000
-                                        : 7 * 24 * 60 * 60 * 1000;
-                                    while (resetAt < now) { resetAt += cycle; }
+                                    // Try both cycle lengths and pick the one
+                                    // that produces the nearest future reset.
+                                    const SHORT_CYCLE = 5 * 60 * 60 * 1000;   // 5 hours
+                                    const LONG_CYCLE  = 7 * 24 * 60 * 60 * 1000; // 7 days
+                                    const diffMs = now - resetAt;
+
+                                    const next5h  = resetAt + Math.ceil(diffMs / SHORT_CYCLE) * SHORT_CYCLE;
+                                    const nextWeek = resetAt + Math.ceil(diffMs / LONG_CYCLE) * LONG_CYCLE;
+
+                                    // Pick whichever lands closest to now without
+                                    // overshooting by more than one full cycle.
+                                    resetAt = (next5h - now) <= SHORT_CYCLE ? next5h : nextWeek;
                                 }
                             }
                         }
@@ -558,7 +588,7 @@ export class QuotaFetcher {
 
             results.push({
                 modelId,
-                modelName: modelInfo.name,
+                modelName: displayName,
                 remaining,
                 total,
                 pctRemaining: finalPct,

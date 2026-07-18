@@ -1,6 +1,7 @@
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
 
 const isWin = process.platform === "win32";
 const isMac = process.platform === "darwin";
@@ -12,21 +13,11 @@ const vsixPath = path.join(distDir, extensionName);
 
 /**
  * Run a command cross-platform.
- *
- * On Windows we must use `shell: true` so that npm/npx (which are .cmd/.ps1
- * scripts) can be found. But `shell: true` with `spawnSync` just concatenates
- * the args with spaces, so any arg that contains a space (e.g. a user-profile
- * path like "C:\Users\Jyothi Deshpande\...") will be split into multiple
- * tokens by cmd.exe.  We fix this by wrapping every argument in double-quotes.
- *
- * On macOS / Linux we do NOT use shell: true, so Node passes each arg as a
- * discrete argv entry and spaces are never a problem.
  */
 function run(command, args) {
   let result;
 
   if (isWin) {
-    // Quote every argument so cmd.exe never splits on spaces.
     const quoted = args.map((a) => `"${a}"`);
     result = spawnSync(command, quoted, {
       cwd: root,
@@ -34,7 +25,6 @@ function run(command, args) {
       shell: true,
     });
   } else {
-    // Unix: no shell needed; args are passed as-is.
     result = spawnSync(command, args, {
       cwd: root,
       stdio: "inherit",
@@ -56,34 +46,38 @@ function run(command, args) {
  * Returns the CLI name/path that works, or null.
  */
 function findEditorCli() {
-  // Common CLI names that exist on $PATH / %PATH%
-  const candidates = [
+  const candidates = [];
+
+  if (isMac) {
+    candidates.push(
+      "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+      "/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity"
+    );
+  }
+
+  candidates.push(
     "code",       // VS Code
     "cursor",     // Cursor
     "windsurf",   // Windsurf
-    "codium",     // VSCodium
-  ];
+    "codium"      // VSCodium
+  );
 
-  // Platform-specific absolute paths for editors that may not be on PATH
   if (isMac) {
     candidates.push(
-      "/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity",
       "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
-      "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+      "/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
     );
   } else if (isWin) {
-    // On Windows, VS Code's CLI is usually on PATH after install, but add
-    // well-known locations as fallbacks.
     const localAppData = process.env.LOCALAPPDATA || "";
     const programFiles = process.env["ProgramFiles"] || "C:\\Program Files";
     if (localAppData) {
       candidates.push(
         path.join(localAppData, "Programs", "Microsoft VS Code", "bin", "code.cmd"),
-        path.join(localAppData, "Programs", "cursor", "resources", "app", "bin", "cursor.cmd"),
+        path.join(localAppData, "Programs", "cursor", "resources", "app", "bin", "cursor.cmd")
       );
     }
     candidates.push(
-      path.join(programFiles, "Microsoft VS Code", "bin", "code.cmd"),
+      path.join(programFiles, "Microsoft VS Code", "bin", "code.cmd")
     );
   }
 
@@ -100,11 +94,52 @@ function findEditorCli() {
         return candidate;
       }
     } catch {
-      // ignore – candidate simply not available
+      // ignore
     }
   }
 
   return null;
+}
+
+/**
+ * Directly copy built files to all local Antigravity & Cursor extension folders.
+ * This guarantees the updates take effect even if the CLI installation targeted
+ * a different/secondary editor, or if the CLI symlink is broken.
+ */
+function syncToLocalExtensions() {
+  const home = os.homedir();
+  const searchDirs = [
+    path.join(home, ".antigravity", "extensions"),
+    path.join(home, ".antigravity-ide", "extensions"),
+    path.join(home, ".cursor", "extensions"),
+  ];
+
+  for (const dir of searchDirs) {
+    if (!fs.existsSync(dir)) continue;
+
+    try {
+      const items = fs.readdirSync(dir);
+      for (const item of items) {
+        if (item.startsWith("ameyakulkarni.orbit-hub")) {
+          const targetPath = path.join(dir, item);
+          console.log(`Syncing built files directly to: ${targetPath}`);
+
+          fs.cpSync(path.join(root, "package.json"), path.join(targetPath, "package.json"), { force: true });
+          fs.cpSync(path.join(root, "out"), path.join(targetPath, "out"), { recursive: true, force: true });
+          fs.cpSync(path.join(root, "webview"), path.join(targetPath, "webview"), { recursive: true, force: true });
+          fs.cpSync(path.join(root, "resources"), path.join(targetPath, "resources"), { recursive: true, force: true });
+
+          const sqlJsSrc = path.join(root, "node_modules", "sql.js");
+          if (fs.existsSync(sqlJsSrc)) {
+            fs.cpSync(sqlJsSrc, path.join(targetPath, "node_modules", "sql.js"), { recursive: true, force: true });
+          }
+          console.log("  Sync complete.");
+        }
+      }
+    } catch (err) {
+      console.error(`Error reading/writing in ${dir}:`, err.message);
+    }
+  }
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -116,6 +151,10 @@ run("npm", ["run", "compile"]);
 
 console.log(`\nPackaging extension to ${vsixPath}...`);
 run("npx", ["@vscode/vsce", "package", "--out", vsixPath]);
+
+// Perform direct filesystem synchronization first for robust caching
+console.log("\nSynchronizing built files to extension directories...");
+syncToLocalExtensions();
 
 const editorCli = findEditorCli();
 

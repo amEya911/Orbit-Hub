@@ -13,6 +13,7 @@ export interface Account {
 export interface CachedQuota {
     accountId: string;
     models: ModelCache[];
+    isPro?: boolean;
     fetchedAt: number;
 }
 

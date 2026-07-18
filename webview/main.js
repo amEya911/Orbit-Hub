@@ -2,7 +2,7 @@
 'use strict';
 
 const vscode = acquireVsCodeApi();
-let state = { accounts: [], models: [] };
+let state = { accounts: [] };
 let collapsedAccounts = new Set();
 let initialized = false;
 
@@ -16,9 +16,9 @@ window.addEventListener('DOMContentLoaded', () => {
     document.body.appendChild(tooltip);
 
     document.addEventListener('mousemove', e => {
-        const track = e.target.closest('.bar-track');
-        if (track) {
-            const pct = track.dataset.pct;
+        const bar = e.target.closest('.limit-bar-track');
+        if (bar) {
+            const pct = bar.dataset.pct;
             tooltip.textContent = `${pct}% remaining`;
             tooltip.classList.add('visible');
             tooltip.style.left = `${e.clientX}px`;
@@ -67,17 +67,7 @@ window.addEventListener('DOMContentLoaded', () => {
         vscode.postMessage({ type: 'reorderAccounts', ids });
     });
 
-    // Event Delegation for interactivity.
-    //
-    // BUG FIX (Bug 2): The refresh button (.refresh-btn) is rendered inside
-    // .account-header.  The original handler checked .account-header first,
-    // so every click that bubbled up from the button matched the header branch
-    // and called toggleAccount() instead of cmd_refresh().
-    // e.stopPropagation() inside the button branch never ran because it was
-    // reached too late.
-    //
-    // Fix: check for .refresh-btn BEFORE .account-header so the button click
-    // is handled (and propagation stopped) before the header check can match.
+    // Event Delegation
     document.addEventListener('click', e => {
         const refreshBtn = e.target.closest('.refresh-btn');
         if (refreshBtn) {
@@ -125,6 +115,8 @@ window.addEventListener('message', ev => {
     }
 });
 
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
 function render() {
     const app = document.getElementById('app');
     if (!app) { return; }
@@ -160,14 +152,26 @@ function buildSignedOutBanner() {
 }
 
 function buildAccount(entry) {
-    const { account, models, fetchedAt } = entry;
+    const { account, models, fetchedAt, isPro } = entry;
     const isCollapsed = collapsedAccounts.has(account.id);
     const fetchedStr = fetchedAt ? formatFetchedTime(fetchedAt, account.isActive) : null;
+    const groups = groupModels(models, isPro);
 
-    // Only show refresh button for active accounts
     const refreshHtml = account.isActive
         ? `<button class="refresh-btn" title="Refresh">↻</button>`
         : '';
+
+    let bodyContent;
+    if (models.length === 0) {
+        bodyContent = '<div class="waiting-message">Waiting for quota data…</div>';
+    } else if (groups.length === 0) {
+        bodyContent = '<div class="waiting-message">No model quota data available.</div>';
+    } else {
+        bodyContent = `
+        <div class="model-quota-label">Model Quota</div>
+        <div class="model-quota-description">Within each group, models share a weekly limit${groups.some(g => g.fiveHourLimit) ? ' and a 5-hour limit' : ''}. Quota is consumed proportionally to the cost of the tokens.</div>
+        ${groups.map(g => buildGroupCard(g, account.isActive, isPro)).join('')}`;
+    }
 
     return `
     <div class="account-section ${isCollapsed ? 'collapsed' : ''}" id="acc-${esc(account.id)}" draggable="true">
@@ -187,10 +191,7 @@ function buildAccount(entry) {
         </div>
       </div>
       <div class="account-body">
-        <div class="model-quota-label">MODEL QUOTA</div>
-        <div class="quota-card">
-          ${models.map(m => buildModelRow(m, account.isActive)).join('')}
-        </div>
+        ${bodyContent}
       </div>
     </div>`;
 }
@@ -204,110 +205,226 @@ function toggleAccount(id) {
     render();
 }
 
-function buildModelRow(m, isAccountActive) {
-    if (m.state === 'unknown') {
-        return `<div class="model-row">
-          <div class="model-row-top">
-            <span class="model-name">${esc(m.modelName)}</span>
-            <span class="model-reset muted">—</span>
-          </div>
-          <div class="bar-track">
-            ${Array(5).fill('<div class="segment"></div>').join('')}
-          </div>
-        </div>`;
+// ── Model grouping ────────────────────────────────────────────────────────────
+
+function groupModels(models, isPro) {
+    if (!models || models.length === 0) { return []; }
+
+    const buckets = {};
+
+    for (const m of models) {
+        const name = m.modelName.toLowerCase();
+        let key, groupName;
+
+        if (name.includes('gemini')) {
+            key = 'gemini';
+            groupName = 'Gemini Models';
+        } else {
+            key = 'gpt';
+            groupName = 'Claude and GPT models';
+        }
+
+        if (!buckets[key]) {
+            buckets[key] = { name: groupName, entries: [] };
+        }
+        buckets[key].entries.push(m);
     }
 
-    const pct = m.pctRemaining ?? 0;
-    const segmentsFilled = Math.max(0, Math.min(5, Math.ceil(pct / 20)));
+    const result = [];
+    const orderedKeys = ['gemini', 'gpt'].filter(k => buckets[k]);
 
-    let statusCls = 'filled';
-    if (m.state === 'exhausted') statusCls = 'exhausted';
-    else if (m.state === 'low') statusCls = 'low';
-    else if (segmentsFilled === 2) statusCls = 'medium';
-    else if (m.state === 'available') statusCls = 'available';
+    for (const key of orderedKeys) {
+        const group = buckets[key];
+        const entries = group.entries;
+        if (entries.length === 0) { continue; }
 
-    const isStale = m.isStale ?? false;
-    const ageDays = m.dataAgeMs ? Math.floor(m.dataAgeMs / (24 * 60 * 60 * 1000)) : 0;
-    const staleMsg = isStale ? (ageDays > 0 ? `Synced ${ageDays}d ago` : 'Synced recently') : '';
+        let weeklyLimit = null;
+        let fiveHourLimit = null;
 
-    const warnIcon = (m.state === 'low' || m.state === 'exhausted' || isStale) ? `<span class="warn-icon" title="${isStale ? `Data is ${ageDays}d old. Open Anti-Gravity IDE and refresh to sync.` : ''}"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L1 21h22L12 2zm0 4l7.53 13H4.47L12 6zm-1 5v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg></span>` : '';
-    const fetchedStr = m.fetchedAt ? formatFetchedTime(m.fetchedAt, isAccountActive) : '—';
+        if (isPro) {
+            // PRO Account:
+            // 1. Five Hour Limit comes directly from the protobuf percentage and reset.
+            fiveHourLimit = {
+                pctRemaining: entries[0].pctRemaining,
+                resetAt: entries[0].resetAt,
+                state: entries[0].state,
+            };
 
-    const resetStr = `<span class="model-reset" 
-      data-reset="${m.resetAt}" 
-      data-active="${isAccountActive}"
-      data-is-stale="${isStale}"
-      data-stale-msg="${staleMsg}"
-      data-state="${m.state}">${fmtReset(m.resetAt, isAccountActive, m.state, isStale, staleMsg)}</span>`;
+            // 2. Weekly Limit is calculated from the remaining credits.
+            const limitTotal = key === 'gemini' ? 1280 : 2560;
+            const maxRemaining = Math.max(...entries.map(e => e.remaining ?? 0));
+            const calculatedPct = Math.min(100, Math.round((maxRemaining / limitTotal) * 100));
 
-    const segmentsHtml = Array.from({ length: 5 }, (_, i) => {
-        const cls = i < segmentsFilled ? `filled ${statusCls}` : '';
-        return `<div class="segment ${cls}"></div>`;
-    }).join('');
+            // Weekly reset time: calculate next Wednesday 17:00 UTC
+            const weeklyResetAt = getWeeklyResetTime();
 
-    return `<div class="model-row">
-      <div class="model-row-top">
-        <div class="model-name-wrapper">
-          <span class="model-name">${esc(m.modelName)}</span>
-          ${warnIcon}
-          <span class="fetched-badge">Fetched ${fetchedStr}</span>
-        </div>
-        ${resetStr}
+            weeklyLimit = {
+                pctRemaining: calculatedPct,
+                resetAt: weeklyResetAt,
+                state: calculatedPct >= 100 ? 'available' : 'used',
+            };
+        } else {
+            // NORMAL Account (non-Pro):
+            // 1. Weekly Limit comes directly from the protobuf percentage and reset.
+            weeklyLimit = {
+                pctRemaining: entries[0].pctRemaining,
+                resetAt: entries[0].resetAt,
+                state: entries[0].state,
+            };
+            // 2. No Five Hour Limit.
+            fiveHourLimit = null;
+        }
+
+        result.push({
+            name: group.name,
+            weeklyLimit,
+            fiveHourLimit,
+        });
+    }
+
+    return result;
+}
+
+// ── Group card rendering ──────────────────────────────────────────────────────
+
+function buildGroupCard(group, isAccountActive, isPro) {
+    const parts = [];
+
+    if (group.weeklyLimit) {
+        parts.push(buildLimitRow('Weekly Limit', group.weeklyLimit, isAccountActive, 'weekly', isPro));
+    }
+
+    if (group.fiveHourLimit) {
+        parts.push(buildLimitRow('Five Hour Limit', group.fiveHourLimit, isAccountActive, '5hour', isPro));
+    }
+
+    return `<div class="group-card">
+      <div class="group-header">
+        <span class="group-name">${esc(group.name)}</span>
+        <span class="info-icon" title="Within this group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally.">i</span>
       </div>
-      <div class="bar-track" data-pct="${segmentsFilled * 20}">
-        ${segmentsHtml}
+      ${parts.join('')}
+    </div>`;
+}
+
+function buildLimitRow(label, limitData, isAccountActive, limitType, isPro) {
+    const pct = limitData.pctRemaining ?? 0;
+    const colorCls = getColorClass(pct);
+    const descriptionText = buildLimitDescription(pct, limitData.resetAt, isAccountActive, limitData.state, limitType, isPro);
+
+    return `<div class="limit-row">
+      <div class="limit-left">
+        <span class="limit-label">${esc(label)}</span>
+        <div class="limit-description"
+             data-reset="${limitData.resetAt}"
+             data-active="${isAccountActive}"
+             data-state="${limitData.state || ''}"
+             data-limit-type="${limitType}"
+             data-pct="${pct}"
+             data-is-pro="${isPro}">${descriptionText}</div>
+      </div>
+      <div class="limit-right">
+        <span class="limit-pct ${colorCls}">${pct}%</span>
+        <div class="limit-bar-track" data-pct="${pct}">
+          <div class="limit-bar-fill ${colorCls}" style="width: ${Math.max(0, Math.min(100, pct))}%"></div>
+        </div>
       </div>
     </div>`;
 }
 
+function getColorClass(pct) {
+    if (pct <= 0) return 'exhausted';
+    if (pct <= 20) return 'low';
+    if (pct <= 50) return 'medium';
+    return 'ok';
+}
+
+function buildLimitDescription(pct, resetAt, isAccountActive, state, limitType, isPro) {
+    const limitName = limitType === '5hour' ? '5-hour limit' : 'weekly limit';
+
+    if (state === 'available' || pct >= 100) {
+        return `Your ${limitName} is fully available.`;
+    }
+
+    if (pct <= 0) {
+        const resetStr = fmtResetDuration(resetAt, limitType, isPro);
+        return `Your ${limitName} is exhausted. It will refresh ${resetStr}.`;
+    }
+
+    const resetStr = fmtResetDuration(resetAt, limitType, isPro);
+    return `You have used some of your ${limitName}, it will fully refresh ${resetStr}.`;
+}
+
+// ── Countdown / reset formatting ──────────────────────────────────────────────
+
 function tickCountdowns() {
-    document.querySelectorAll('[data-reset]').forEach(el => {
+    document.querySelectorAll('.limit-description[data-reset]').forEach(el => {
+        const resetAt = parseInt(el.dataset.reset, 10);
         const active = el.dataset.active === 'true';
-        const state = el.dataset.state;
-        const isStale = el.dataset.isStale === 'true';
-        const staleMsg = el.dataset.staleMsg || '';
-        el.textContent = fmtReset(parseInt(el.dataset.reset, 10), active, state, isStale, staleMsg);
+        const state = el.dataset.state || '';
+        const limitType = el.dataset.limitType || 'weekly';
+        const pct = parseInt(el.dataset.pct, 10) || 0;
+        const isPro = el.dataset.isPro === 'true';
+        el.textContent = buildLimitDescription(pct, resetAt, active, state, limitType, isPro);
     });
 }
 
-function fmtReset(ms, isActiveAccount = true, state = '', isStale = false, staleMsg = '') {
-    if (state === 'available') return '100% credits available';
-
-    const prefix = isStale ? ` (${staleMsg})` : '';
+function fmtReset(ms, isActiveAccount, state, limitType) {
+    if (state === 'available') return 'Fully available';
 
     const diff = ms - Date.now();
     if (diff <= 0) {
-        return (isActiveAccount ? 'Refreshing…' : 'Available') + prefix;
+        return isActiveAccount ? 'Refreshing…' : 'Available';
+    }
+    return fmtResetDuration(ms, limitType);
+}
+
+function fmtResetDuration(ms, limitType, isPro) {
+    const diff = ms - Date.now();
+    if (diff <= 0) {
+        return 'shortly';
     }
     const s = Math.floor(diff / 1000);
     const d = Math.floor(s / 86400);
     const h = Math.floor((s % 86400) / 3600);
     const m = Math.floor((s % 3600) / 60);
 
-    if (!isActiveAccount && d === 0 && h === 0 && m === 0) return 'Available' + prefix;
-
-    if (d > 0) { return `Resets in ${d}d ${h}h` + prefix; }
-    if (h > 0) { return `Resets in ${h}h ${m}m` + prefix; }
-    return `Resets in ${m}m ${pad(s % 60)}s` + prefix;
+    if (d > 0) {
+        if (limitType === 'weekly' && isPro) {
+            return `in ${d} day${d > 1 ? 's' : ''}`;
+        }
+        return `in ${d} day${d > 1 ? 's' : ''}, ${h} hour${h !== 1 ? 's' : ''}`;
+    }
+    if (h > 0) { return `in ${h} hour${h > 1 ? 's' : ''}, ${m} minute${m !== 1 ? 's' : ''}`; }
+    return `in ${m} minute${m !== 1 ? 's' : ''}`;
 }
 
-function pad(n) { return String(n).padStart(2, '0'); }
+function getWeeklyResetTime() {
+    const now = new Date();
+    // Wednesday 17:00
+    const reset = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 17, 0, 0, 0);
+    const dayDiff = (3 - now.getDay() + 7) % 7;
+    reset.setDate(now.getDate() + (dayDiff === 0 ? 7 : dayDiff));
+    return reset.getTime();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatFetchedTime(ms, isActive) {
     if (!ms) return null;
     const date = new Date(ms);
     const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    
+
     if (isActive) {
         return timeStr;
     }
-    
+
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const fetchDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
     const diffDays = Math.floor((today - fetchDay) / (1000 * 60 * 60 * 24));
     const shortTime = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    
+
     if (diffDays === 0) {
         return `today ${shortTime}`;
     } else if (diffDays === 1) {
@@ -325,17 +442,13 @@ function formatFetchedTime(ms, isActive) {
         return `${years} year${years > 1 ? 's' : ''} ago`;
     }
 }
+
 function esc(str) {
     return String(str ?? '')
         .replace(/&/g, '&amp;').replace(/</g, '&lt;')
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
+
 function cmd_refresh() { vscode.postMessage({ type: 'refresh' }); }
-
-function cmd_reset() {
-    vscode.postMessage({ type: 'reset' });
-}
-
-function cmd_removeAccount(id) {
-    vscode.postMessage({ type: 'removeAccount', id });
-}
+function cmd_reset() { vscode.postMessage({ type: 'reset' }); }
+function cmd_removeAccount(id) { vscode.postMessage({ type: 'removeAccount', id }); }

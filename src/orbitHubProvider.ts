@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import { AccountManager } from './accountManager';
-import { QuotaFetcher, MODELS } from './quotaFetcher';
+import { QuotaFetcher } from './quotaFetcher';
 
 export class OrbitHubProvider implements vscode.WebviewViewProvider {
     private view?: vscode.WebviewView;
@@ -144,6 +144,7 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     await this.accountManager.updateCachedQuota({
                         accountId: active.id,
                         models: result.models,
+                        isPro: result.isPro,
                         fetchedAt: Date.now(),
                     });
                     this.stopSyncRetryWindow();
@@ -191,12 +192,9 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
         const payload = visibleAccounts.map(acc => {
             const cache = allCached[acc.id] ?? null;
 
-            const models = MODELS.map(m => {
-                const cached = cache?.models.find(c => c.modelId === m.id) ?? null;
-                if (!cached) {
-                    return { modelId: m.id, modelName: m.name, state: 'unknown' as const };
-                }
-
+            // Build model list dynamically from cached data — no hardcoded MODELS array.
+            const cachedModels = cache?.models ?? [];
+            const models = cachedModels.map(cached => {
                 const now = Date.now();
                 let pctRemaining = cached.pctRemaining ?? (
                     cached.total > 0
@@ -242,11 +240,12 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                     syncError: (acc as any).syncError
                 },
                 fetchedAt: cache?.fetchedAt ?? null,
+                isPro: cache?.isPro ?? false,
                 models,
             };
         });
 
-        void this.view.webview.postMessage({ type: 'state', accounts: payload, models: MODELS });
+        void this.view.webview.postMessage({ type: 'state', accounts: payload });
     }
 
     private startSyncRetryWindow(): void {
@@ -286,14 +285,14 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
 <head>
   <meta charset="UTF-8">
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+        content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="${styleUri}">
+  <link rel="stylesheet" href="${styleUri}?v=${nonce}">
   <title>Orbit Hub</title>
 </head>
 <body>
   <div id="app"></div>
-  <script nonce="${nonce}" src="${scriptUri}"></script>
+  <script nonce="${nonce}" src="${scriptUri}?v=${nonce}"></script>
 </body>
 </html>`;
     }
