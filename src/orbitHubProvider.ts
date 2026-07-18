@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import { AccountManager } from './accountManager';
 import { QuotaFetcher } from './quotaFetcher';
 
@@ -80,6 +81,23 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
     }
 
     async refresh(): Promise<void> {
+        const syncCmds = [
+            'antigravity.refreshUserStatus',
+            'cursor.refreshUserStatus',
+            'antigravity.action.refreshUserStatus',
+            'cursor.action.refreshUserStatus',
+            'antigravity.syncUserStatus',
+            'cursor.syncUserStatus'
+        ];
+        for (const cmd of syncCmds) {
+            try {
+                await vscode.commands.executeCommand(cmd);
+                break;
+            } catch (err) {
+                // Ignore and try next candidate
+            }
+        }
+
         this.sendState();
         try {
             const active = await this.quotaFetcher.detectActiveAccount();
@@ -141,9 +159,70 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
                 await this.context.globalState.update('orbitHub.accounts', accounts);
 
                 if (result.models.length > 0) {
+                    // Compute weekly percentage from high-water-mark tracking.
+                    // The protobuf f15 field is the 5-hour limit only; the weekly
+                    // percentage must be derived from remaining / weeklyTotal.
+                    const oldCache = this.accountManager.getCachedQuota(active.id);
+                    const oldModels = oldCache?.models ?? [];
+
+                    const computedModels = result.models.map(m => {
+                        const old = oldModels.find(o => o.modelId === m.modelId);
+                        // High-water mark: the maximum `remaining` we have ever observed
+                        // for this model.  When the weekly quota resets (every Wednesday),
+                        // remaining goes back up, pushing the high-water mark.
+                        const prevTotal = old?.weeklyTotal ?? 0;
+
+                        // Use known weekly capacity baselines for Pro/Ultra accounts to avoid cold-start/bad-caching issues.
+                        let baselineTotal = 2500;
+                        const id = m.modelId.toLowerCase();
+                        if (id.includes('gemini-3.5-flash-medium')) baselineTotal = 1229;
+                        else if (id.includes('gemini-3.5-flash-high')) baselineTotal = 1364;
+                        else if (id.includes('gemini-3.5-flash-low')) baselineTotal = 1430;
+                        else if (id.includes('gemini-3.1-pro-low')) baselineTotal = 1248;
+                        else if (id.includes('gemini-3.1-pro-high')) baselineTotal = 1224;
+                        else if (id.includes('gemini')) baselineTotal = 1250;
+                        else if (id.includes('gpt-oss')) baselineTotal = 800;
+
+                        const weeklyTotal = Math.max(baselineTotal, m.remaining);
+
+                        let weeklyPct: number;
+                        let weeklyReset = m.weeklyReset;
+
+                        if (m.weeklyPct >= 0) {
+                            // Parser provided a real value (future-proof)
+                            weeklyPct = m.weeklyPct;
+                        } else {
+                            if (weeklyTotal > 0) {
+                                weeklyPct = Math.round((m.remaining / weeklyTotal) * 100);
+                            } else {
+                                weeklyPct = 100;
+                            }
+
+                            // Compute weekly reset: next Wednesday at 17:00 UTC
+                            const now = new Date();
+                            const utcDay = now.getUTCDay(); // 0=Sun … 3=Wed
+                            let daysUntilWed = (3 - utcDay + 7) % 7;
+                            if (daysUntilWed === 0) {
+                                // If it's Wednesday, check if we're past 17:00 UTC
+                                if (now.getUTCHours() >= 17) { daysUntilWed = 7; }
+                            }
+                            const nextWed = new Date(now);
+                            nextWed.setUTCDate(now.getUTCDate() + daysUntilWed);
+                            nextWed.setUTCHours(17, 0, 0, 0);
+                            weeklyReset = nextWed.getTime();
+                        }
+
+                        return {
+                            ...m,
+                            weeklyPct,
+                            weeklyReset,
+                            weeklyTotal,
+                        };
+                    });
+
                     await this.accountManager.updateCachedQuota({
                         accountId: active.id,
-                        models: result.models,
+                        models: computedModels,
                         isPro: result.isPro,
                         fetchedAt: Date.now(),
                     });
@@ -196,39 +275,58 @@ export class OrbitHubProvider implements vscode.WebviewViewProvider {
             const cachedModels = cache?.models ?? [];
             const models = cachedModels.map(cached => {
                 const now = Date.now();
-                let pctRemaining = cached.pctRemaining ?? (
-                    cached.total > 0
-                        ? Math.round((cached.remaining / cached.total) * 100)
-                        : 0
-                );
 
-                let isEstimation = false;
-                if (!acc.isActive && cached.resetAt > 0 && now > cached.resetAt) {
-                    pctRemaining = 100;
-                    isEstimation = true;
+                let weeklyPct = cached.weeklyPct !== undefined ? cached.weeklyPct : ((cached as any).pctRemaining !== undefined ? (cached as any).pctRemaining : 100);
+                let fiveHourPct = cached.fiveHourPct !== undefined ? cached.fiveHourPct : (cache?.isPro ? 100 : undefined);
+                let isWeeklyEstimation = false;
+                let isFiveHourEstimation = false;
+
+                if (!acc.isActive) {
+                    if (cached.weeklyReset > 0 && now > cached.weeklyReset) {
+                        weeklyPct = 100;
+                        isWeeklyEstimation = true;
+                    }
+                    if (cached.fiveHourReset && cached.fiveHourReset > 0 && now > cached.fiveHourReset) {
+                        fiveHourPct = 100;
+                        isFiveHourEstimation = true;
+                    }
                 }
+
                 const isStale = acc.isActive && (now - cached.fetchedAt > 60 * 60 * 1000); // 1 hour
 
-                const state = (
-                    pctRemaining <= 0 ? 'exhausted' :
-                        pctRemaining <= 20 ? 'low' :
-                            isEstimation ? 'available' :
+                const weeklyState = (
+                    weeklyPct <= 0 ? 'exhausted' :
+                        weeklyPct <= 20 ? 'low' :
+                            isWeeklyEstimation ? 'available' :
                                 isStale ? 'low' : 'ok'
                 ) as 'ok' | 'low' | 'exhausted' | 'available';
+
+                let fiveHourState: 'ok' | 'low' | 'exhausted' | 'available' | undefined = undefined;
+                if (fiveHourPct !== undefined) {
+                    fiveHourState = (
+                        fiveHourPct <= 0 ? 'exhausted' :
+                            fiveHourPct <= 20 ? 'low' :
+                                isFiveHourEstimation ? 'available' :
+                                    isStale ? 'low' : 'ok'
+                    ) as 'ok' | 'low' | 'exhausted' | 'available';
+                }
 
                 return {
                     modelId: cached.modelId,
                     modelName: cached.modelName,
                     remaining: cached.remaining,
-                    total: cached.total,
-                    pctRemaining,
-                    resetAt: cached.resetAt,
+                    weeklyPct,
+                    weeklyReset: cached.weeklyReset,
+                    weeklyState,
+                    isWeeklyEstimation,
+                    fiveHourPct,
+                    fiveHourReset: cached.fiveHourReset,
+                    fiveHourState,
+                    isFiveHourEstimation,
                     fetchedAt: cached.fetchedAt,
                     isActive: acc.isActive,
-                    isEstimation,
                     isStale,
                     dataAgeMs: now - cached.fetchedAt,
-                    state,
                 };
             });
 

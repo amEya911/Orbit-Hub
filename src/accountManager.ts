@@ -21,9 +21,11 @@ export interface ModelCache {
     modelId: string;
     modelName: string;
     remaining: number;
-    total: number;
-    pctRemaining: number;   // float×100 integer (0–100) from the proto
-    resetAt: number;
+    weeklyPct: number;
+    weeklyReset: number;
+    weeklyTotal?: number;        // high-water mark for weekly capacity
+    fiveHourPct?: number;     // undefined if not Pro/Ultra
+    fiveHourReset?: number;   // undefined if not Pro/Ultra
     fetchedAt: number;
 }
 

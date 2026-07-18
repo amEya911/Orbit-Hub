@@ -32,9 +32,10 @@ export interface RawModelQuota {
     modelId: string;
     modelName: string;
     remaining: number;
-    total: number;
-    pctRemaining: number;
-    resetAt: number;
+    weeklyPct: number;
+    weeklyReset: number;
+    fiveHourPct?: number;
+    fiveHourReset?: number;
     fetchedAt: number;
 }
 
@@ -204,10 +205,8 @@ export class QuotaFetcher {
             const liveUserStatus = await this.getLiveUserStatusCandidate();
             if (liveUserStatus?.email === account.id) {
                 const models = this.parseUserStatus(liveUserStatus.buf);
-                const isPro = this.checkIsPro(liveUserStatus.buf) || models.some(m => {
-                    const cycle = m.resetAt - Date.now();
-                    return cycle > 0 && cycle < 24 * 60 * 60 * 1000;
-                });
+                console.log(`[OrbitHub] Live API userStatus for ${account.id}: models=${JSON.stringify(models.map(m => ({ id: m.modelId, remaining: m.remaining, fiveHourPct: m.fiveHourPct, weeklyPct: m.weeklyPct })))}`);
+                const isPro = this.checkIsPro(liveUserStatus.buf) || models.some(m => m.fiveHourPct !== undefined);
                 return {
                     account,
                     models,
@@ -222,6 +221,7 @@ export class QuotaFetcher {
             try {
                 const userStatus = this.extractMatchingUserStatus(db, account);
                 if (!userStatus) {
+                    console.log(`[OrbitHub] No matching userStatus in DB for ${account.id}`);
                     return {
                         account,
                         models: [],
@@ -232,15 +232,14 @@ export class QuotaFetcher {
                 }
 
                 const models = this.parseUserStatus(userStatus.buf);
-                const isPro = this.checkIsPro(userStatus.buf) || models.some(m => {
-                    const cycle = m.resetAt - Date.now();
-                    return cycle > 0 && cycle < 24 * 60 * 60 * 1000;
-                });
+                console.log(`[OrbitHub] DB userStatus for ${account.id}: models=${JSON.stringify(models.map(m => ({ id: m.modelId, remaining: m.remaining, fiveHourPct: m.fiveHourPct, weeklyPct: m.weeklyPct })))}`);
+                const isPro = this.checkIsPro(userStatus.buf) || models.some(m => m.fiveHourPct !== undefined);
                 return { account, models, isPro };
             } finally {
                 db.close();
             }
         } catch (err: unknown) {
+            console.error('[OrbitHub] fetchQuota failed:', err);
             return {
                 account,
                 models: [],
@@ -410,12 +409,14 @@ export class QuotaFetcher {
 
         const authStatusBuf = this.extractAuthStatusUserStatusBuf(authStatus);
         if (authStatusBuf) {
-            candidates.push({
-                source: 'authStatus',
-                email: this.extractEmailFromUserStatusBuf(authStatusBuf)
-                    ?? this.extractEmailCandidate(authStatus?.email),
-                buf: authStatusBuf,
-            });
+            const parsedEmail = this.extractEmailFromUserStatusBuf(authStatusBuf);
+            if (parsedEmail) {
+                candidates.push({
+                    source: 'authStatus',
+                    email: parsedEmail,
+                    buf: authStatusBuf,
+                });
+            }
         }
 
         return candidates;
@@ -524,75 +525,105 @@ export class QuotaFetcher {
             const f2 = f2buf ? decode(f2buf) : {};
             const remaining = getNum(f2, 1) ?? 0;
 
-            let pctRemaining = 0;
-            let resetAt = now + 7 * 24 * 60 * 60 * 1000;
+            // ── Parse f15: this is the 5-hour rolling limit ──────────────────
+            // The protobuf only stores ONE limit per model in f15, and it is
+            // the 5-hour (SHORT_TERM) rolling limit.  The weekly limit
+            // percentage is NOT available in the protobuf and must be computed
+            // from remaining / weeklyTotal (high-water mark) at the provider
+            // layer.
+            const f15s = (f[15] ?? []).filter((v): v is Buffer => Buffer.isBuffer(v));
 
-            const f15buf = getBuf(f, 15);
-            if (f15buf) {
+            let fiveHourFraction = 1.0;
+            let fiveHourResetMs = 0;
+
+            for (const limitBuf of f15s) {
+                let pct = 0.0;
+                let reset = 0;
+
                 let i = 0;
-                while (i < f15buf.length) {
-                    if (i >= f15buf.length) { break; }
-                    const tag = f15buf[i++];
+                while (i < limitBuf.length) {
+                    const tag = limitBuf[i++];
                     const fn = tag >> 3;
                     const wt = tag & 7;
 
                     if (wt === 5 && fn === 1) {
-                        if (i + 4 <= f15buf.length) {
-                            pctRemaining = f15buf.readFloatLE(i);
+                        if (i + 4 <= limitBuf.length) {
+                            pct = limitBuf.readFloatLE(i);
                             i += 4;
                         }
                     } else if (wt === 2) {
                         let len = 0, shift = 0, b = 0;
-                        do { b = f15buf[i++]; len |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
-                        if (fn === 2 && i + len <= f15buf.length) {
-                            const sub = f15buf.slice(i, i + len);
+                        do { b = limitBuf[i++]; len |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+                        if (fn === 2 && i + len <= limitBuf.length) {
+                            const sub = limitBuf.slice(i, i + len);
                             const subf = decode(sub);
                             const secs = getNum(subf, 1);
                             if (secs && secs > 0) {
-                                resetAt = secs * 1000;
-                                if (resetAt < now) {
-                                    // Try both cycle lengths and pick the one
-                                    // that produces the nearest future reset.
-                                    const SHORT_CYCLE = 5 * 60 * 60 * 1000;   // 5 hours
-                                    const LONG_CYCLE  = 7 * 24 * 60 * 60 * 1000; // 7 days
-                                    const diffMs = now - resetAt;
-
-                                    const next5h  = resetAt + Math.ceil(diffMs / SHORT_CYCLE) * SHORT_CYCLE;
-                                    const nextWeek = resetAt + Math.ceil(diffMs / LONG_CYCLE) * LONG_CYCLE;
-
-                                    // Pick whichever lands closest to now without
-                                    // overshooting by more than one full cycle.
-                                    resetAt = (next5h - now) <= SHORT_CYCLE ? next5h : nextWeek;
-                                }
+                                reset = secs * 1000;
                             }
                         }
                         i += len;
                     } else if (wt === 0) {
                         let b = 0;
-                        do { if (i >= f15buf.length) { break; } b = f15buf[i++]; } while (b & 0x80);
+                        do { if (i >= limitBuf.length) { break; } b = limitBuf[i++]; } while (b & 0x80);
                     } else if (wt === 1) {
                         i += 8;
                     } else {
                         break;
                     }
                 }
+
+                fiveHourFraction = pct;
+                fiveHourResetMs = reset;
             }
 
-            const total = pctRemaining > 0.001
-                ? Math.round(remaining / pctRemaining)
-                : Math.max(remaining, 1280);
+            const isPro = this.checkIsPro(buf);
 
-            const finalPct = pctRemaining > 0
-                ? Math.round(pctRemaining * 100)
-                : 0;
+            const SHORT_CYCLE = 5 * 60 * 60 * 1000;
+            const LONG_CYCLE = 7 * 24 * 60 * 60 * 1000;
+
+            let weeklyPct = -1;
+            let weeklyReset = 0;
+            let fiveHourPct: number | undefined = undefined;
+            let fiveHourReset: number | undefined = undefined;
+
+            if (isPro) {
+                // Pro users: check if f15 represents a weekly limit (Claude, GPT-OSS, or reset is long-term)
+                const isWeekly = modelId.includes('claude') || modelId.includes('gpt-oss') || (fiveHourResetMs && (fiveHourResetMs - now) > 6 * 60 * 60 * 1000);
+
+                if (isWeekly) {
+                    weeklyPct = Math.round(fiveHourFraction * 100);
+                    weeklyReset = fiveHourResetMs > 0 ? fiveHourResetMs : (now + 7 * 24 * 60 * 60 * 1000);
+                    // fiveHourPct is undefined (100% in UI)
+                } else {
+                    fiveHourPct = Math.round(fiveHourFraction * 100);
+                    let resetVal = fiveHourResetMs;
+                    if (resetVal > 0 && resetVal < now) {
+                        resetVal = resetVal + Math.ceil((now - resetVal) / SHORT_CYCLE) * SHORT_CYCLE;
+                    }
+                    fiveHourReset = resetVal > 0 ? resetVal : 0;
+                    weeklyPct = -1; // Sentinel to calculate weekly limit from remaining/capacity
+                    weeklyReset = now + 7 * 24 * 60 * 60 * 1000;
+                }
+            } else {
+                // Non-pro users: f15 is weekly limit
+                weeklyPct = Math.round(fiveHourFraction * 100);
+
+                let resetVal = fiveHourResetMs;
+                if (resetVal > 0 && resetVal < now) {
+                    resetVal = resetVal + Math.ceil((now - resetVal) / LONG_CYCLE) * LONG_CYCLE;
+                }
+                weeklyReset = resetVal > 0 ? resetVal : (now + 7 * 24 * 60 * 60 * 1000);
+            }
 
             results.push({
                 modelId,
                 modelName: displayName,
                 remaining,
-                total,
-                pctRemaining: finalPct,
-                resetAt,
+                weeklyPct,
+                weeklyReset,
+                fiveHourPct,
+                fiveHourReset,
                 fetchedAt: now,
             });
         }
@@ -695,6 +726,7 @@ export class QuotaFetcher {
             case 'win32': {
                 const appData = process.env['APPDATA'] ?? home;
                 bases = [
+                    path.join(appData, 'Antigravity IDE', suffix),
                     path.join(appData, 'Antigravity', suffix),
                     path.join(appData, 'Anti-Gravity', suffix),
                 ];
@@ -703,6 +735,7 @@ export class QuotaFetcher {
             case 'darwin': {
                 const support = path.join(home, 'Library', 'Application Support');
                 bases = [
+                    path.join(support, 'Antigravity IDE', suffix),
                     path.join(support, 'Antigravity', suffix),
                     path.join(support, 'Anti-Gravity', suffix),
                 ];
@@ -711,6 +744,7 @@ export class QuotaFetcher {
             default: {
                 const config = path.join(home, '.config');
                 bases = [
+                    path.join(config, 'Antigravity IDE', suffix),
                     path.join(config, 'Antigravity', suffix),
                     path.join(config, 'Anti-Gravity', suffix),
                 ];

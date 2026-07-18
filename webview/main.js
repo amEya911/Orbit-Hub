@@ -72,6 +72,8 @@ window.addEventListener('DOMContentLoaded', () => {
         const refreshBtn = e.target.closest('.refresh-btn');
         if (refreshBtn) {
             e.stopPropagation();
+            refreshBtn.classList.add('spinning');
+            setTimeout(() => { refreshBtn.classList.remove('spinning'); }, 1000);
             cmd_refresh();
             return;
         }
@@ -238,41 +240,27 @@ function groupModels(models, isPro) {
         const entries = group.entries;
         if (entries.length === 0) { continue; }
 
-        let weeklyLimit = null;
+        const weeklyPct = Math.min(...entries.map(e => e.weeklyPct ?? 100));
+        const weeklyReset = Math.max(...entries.map(e => e.weeklyReset ?? 0));
+        const weeklyState = entries[0].weeklyState || (weeklyPct >= 100 ? 'available' : (weeklyPct <= 20 ? 'low' : 'ok'));
+
+        const weeklyLimit = {
+            pctRemaining: weeklyPct,
+            resetAt: weeklyReset,
+            state: weeklyState,
+        };
+
         let fiveHourLimit = null;
-
         if (isPro) {
-            // PRO Account:
-            // 1. Five Hour Limit comes directly from the protobuf percentage and reset.
+            const fiveHourPct = Math.min(...entries.map(e => e.fiveHourPct ?? 100));
+            const fiveHourReset = Math.max(...entries.map(e => e.fiveHourReset ?? 0));
+            const fiveHourState = entries[0].fiveHourState || (fiveHourPct >= 100 ? 'available' : (fiveHourPct <= 20 ? 'low' : 'ok'));
+
             fiveHourLimit = {
-                pctRemaining: entries[0].pctRemaining,
-                resetAt: entries[0].resetAt,
-                state: entries[0].state,
+                pctRemaining: fiveHourPct,
+                resetAt: fiveHourReset,
+                state: fiveHourState,
             };
-
-            // 2. Weekly Limit is calculated from the remaining credits.
-            const limitTotal = key === 'gemini' ? 1280 : 2560;
-            const maxRemaining = Math.max(...entries.map(e => e.remaining ?? 0));
-            const calculatedPct = Math.min(100, Math.round((maxRemaining / limitTotal) * 100));
-
-            // Weekly reset time: calculate next Wednesday 17:00 UTC
-            const weeklyResetAt = getWeeklyResetTime();
-
-            weeklyLimit = {
-                pctRemaining: calculatedPct,
-                resetAt: weeklyResetAt,
-                state: calculatedPct >= 100 ? 'available' : 'used',
-            };
-        } else {
-            // NORMAL Account (non-Pro):
-            // 1. Weekly Limit comes directly from the protobuf percentage and reset.
-            weeklyLimit = {
-                pctRemaining: entries[0].pctRemaining,
-                resetAt: entries[0].resetAt,
-                state: entries[0].state,
-            };
-            // 2. No Five Hour Limit.
-            fiveHourLimit = null;
         }
 
         result.push({
@@ -399,14 +387,7 @@ function fmtResetDuration(ms, limitType, isPro) {
     return `in ${m} minute${m !== 1 ? 's' : ''}`;
 }
 
-function getWeeklyResetTime() {
-    const now = new Date();
-    // Wednesday 17:00
-    const reset = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 17, 0, 0, 0);
-    const dayDiff = (3 - now.getDay() + 7) % 7;
-    reset.setDate(now.getDate() + (dayDiff === 0 ? 7 : dayDiff));
-    return reset.getTime();
-}
+
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
